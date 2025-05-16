@@ -1,0 +1,48 @@
+/* 기본 여백 제거 */
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+/* 안트디자인 Layout 내부 패딩 제거 */
+.ant-layout,
+.ant-layout-content {
+  margin: 0;
+  padding: 0;
+}
+
+/* ─── 로고 박스 ──────────────────────────────── */
+.ello-logo-box {
+  height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ─── 메뉴를 로고 아래 영역 기준으로 중앙 배치 ── */
+.menu-wrapper {
+  flex: 1; /* 로고 아래 남은 공간을 가득 채움 */
+  margin-top: 30vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center; /* 그 안에서 수직 가운데 */
+}
+
+/* 전역 카드 그림자 + 라운드 */
+.ant-card {
+  box-shadow:
+      /* Layer-One Down */ 0px 1px 2px -2px rgba(0, 0, 0, 0.16),
+    0px 3px 6px 0px rgba(0, 0, 0, 0.12), 0px 5px 12px 4px rgba(0, 0, 0, 0.09) !important;
+  border-radius: 8px !important;
+}
+
+/* ─── 사이드바 우측 그림자 (Layer-One Right) ─── */
+.ello-sider {
+  box-shadow:
+      /* @shadow-1-right */ 1px 0px 2px -2px rgba(0, 0, 0, 0.01),
+    3px 0px 6px 0px rgba(0, 0, 0, 0.05), 5px 0px 12px 4px rgba(0, 0, 0, 0.05) !important;
+  /* 기존 스타일과 충돌하지 않도록 */
+}
