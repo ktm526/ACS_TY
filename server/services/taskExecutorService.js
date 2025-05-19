@@ -179,7 +179,7 @@ if (step.type === 'WAIT_FREE_PATH') {
     if (blocked) {
       // 2) Only *then* if we're still sitting in an IC, redirect to 대기
       const currentSt = stations.find(s => String(s.id) === String(robot.location));
-      if (currentSt && hasClass(currentSt, 'IC')) {
+      if (currentSt && hasClass(currentSt, 'IC') && currentSt.name !== 'LM73' &&String(currentSt.id) !== 'LM73') {
         const waitSt = stations.find(s =>
           hasClass(s, '대기') &&
           regionOf(s) === regionOf(currentSt)

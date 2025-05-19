@@ -264,6 +264,7 @@ async function buildTaskFromRioEdge(route, robot, stations) {
   const findByName = n => stations.find(s => s.name === n);
   const icA = stations.find(s => regionOf(s) === 'A' && hasClass(s, 'IC'));
   const icB = stations.find(s => regionOf(s) === 'B' && hasClass(s, 'IC'));
+  const lm73 = stations.find(s => String(s.id) === '73' || s.name === 'LM73');
   const waitA = stations.find(s => regionOf(s) === 'A' && hasClass(s, '대기'));
   const waitB = stations.find(s => regionOf(s) === 'B' && hasClass(s, '대기'));
 
@@ -310,6 +311,8 @@ async function buildTaskFromRioEdge(route, robot, stations) {
   } else if (route.from === 'B4') { // B4 → A4  (기존에 있던 로직)
     steps = [
       { type: 'NAV', payload: { dest: icB?.id } },
+      { type: 'WAIT_FREE_PATH' },
+      { type: 'NAV', payload: { dest: lm73?.id } },
       { type: 'WAIT_FREE_PATH' },
       { type: 'NAV', payload: { dest: icA?.id } },
       { type: 'WAIT_FREE_PATH' },
