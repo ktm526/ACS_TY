@@ -11,6 +11,7 @@ const axios = require('axios');
 const ModbusRTU = require('modbus-serial');
 const { Op, DataTypes } = require('sequelize');
 
+const { logConnChange } = require('./connectionLogger');
 const MapDB = require('../models/Map');
 const Robot = require('../models/Robot');
 const Log = require('../models/Log');
@@ -187,9 +188,10 @@ exports.sendGotoNav = sendGotoNav;
 
       dev.connected = true;
       console.log(`[RIO] ${ip} connected`);
+      logConnChange(`RIO:${ip}`, true);
 
-      dev.client._port.on('close', () => { dev.connected = false; });
-      dev.client._port.on('error', () => { dev.connected = false; });
+      dev.client._port.on('close', () => { dev.connected = false; logConnChange(`RIO:${ip}`, false); });
+      dev.client._port.on('error', () => { dev.connected = false; logConnChange(`RIO:${ip}`, false); });
     } catch (e) {
       console.error(`[RIO] ${ip} connect error`, e.message);
     }
@@ -204,9 +206,10 @@ async function tryConnectRio(ip, dev) {
   await Promise.race([pConnect, pTimeout]);
   dev.client.setID(RIO_UNIT_ID);
   dev.connected = true;
+  logConnChange(`RIO:${ip}`, true);
   // 재설정된 소켓 가드
-  dev.client._port.on('close', () => { dev.connected = false; });
-  dev.client._port.on('error', () => { dev.connected = false; });
+  dev.client._port.on('close', () => { dev.connected = false; logConnChange(`RIO:${ip}`, false); });
+  dev.client._port.on('error', () => { dev.connected = false; logConnChange(`RIO:${ip}`, false); });
 }
 
 async function pollAllRios() {
@@ -249,6 +252,7 @@ async function pollAllRios() {
       } catch (err) {
         console.error(`[RIO] ${ip} read error:`, err.message);
         dev.connected = false;
+        logConnChange(`RIO:${ip}`, false);
         // 블로킹 소켓 해제
         try { dev.client._port.destroy(); } catch { }
       }
@@ -412,7 +416,7 @@ async function workerTick() {
     }
 
     // Task 실행기
-     taskExecutor.tick().catch(console.error);
+    taskExecutor.tick().catch(console.error);
   } catch (err) {
     console.error('[workerTick]', err);
   } finally { busy = false; }
@@ -462,7 +466,7 @@ async function reconnectRio(ip) {
 
 exports.reconnectRio = reconnectRio;
 
-      // ■ ALRAM 있으면 켜고, 없으면 꺼기
+// ■ ALRAM 있으면 켜고, 없으면 꺼기
 
 /* ─────────────── 10. export (테스트용) ─────────────────────────── */
 exports.workerTick = workerTick;

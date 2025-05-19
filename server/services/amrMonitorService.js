@@ -1,3 +1,5 @@
+//services/amrMonitorService.js
+
 const net = require('net');
 const { Op } = require('sequelize');
 const Robot = require('../models/Robot');
@@ -37,7 +39,7 @@ function handlePush(sock, ip) {
 
     sock.on('data', async chunk => {
         buf = Buffer.concat([buf, chunk]);
-        console.log('ip====',ip)
+        console.log('ip====', ip)
 
         while (buf.length >= 16) {
             if (buf.readUInt8(0) !== 0x5A) {
@@ -51,10 +53,11 @@ function handlePush(sock, ip) {
             buf = buf.slice(16 + len);
 
             let json;
-            try { json = JSON.parse(payload);
+            try {
+                json = JSON.parse(payload);
                 console.log(ip, json.vehicle_id)
-             }
-            catch(err) { console.log('failed to json', ip, err, payload);continue; }
+            }
+            catch (err) { console.log('failed to json', ip, err, payload); continue; }
 
             const name = json.vehicle_id || json.robot_id;
             if (!name) continue;
@@ -117,12 +120,14 @@ function handlePush(sock, ip) {
         sock.destroy();
         sockets.delete(ip);
         await markDisconnectedByIp(ip);
+        logConnChange(`AMR:${ip}`, false);
     });
 
     sock.on('close', () => {
         console.warn(`[AMR] connection closed ${ip}`);
         sockets.delete(ip);
         markDisconnectedByIp(ip);
+        logConnChange(`AMR:${ip}`, false);
     });
 }
 
@@ -142,6 +147,7 @@ async function connect(ip) {
         console.log(`[AMR] connected to ${ip}`);
         sockets.set(ip, sock);
         sock.setTimeout(0);
+        logConnChange(`AMR:${ip}`, true);
         handlePush(sock, ip);
     });
 
@@ -150,6 +156,7 @@ async function connect(ip) {
         sock.destroy();
         sockets.delete(ip);
         await markDisconnectedByIp(ip);
+        logConnChange(`AMR:${ip}`, false);
     });
 }
 
@@ -183,6 +190,7 @@ setInterval(async () => {
             lastRecTime.delete(name);
             // DB 상태 업데이트
             await markDisconnectedByName(name);
+            logConnChange(`AMR:${name}`, false, { robot_name: name });
 
             // 해당 로봇의 IP로 소켓도 강제 종료 → 재접속 유도
             try {
