@@ -3,6 +3,8 @@
 const net = require('net');
 const { Op } = require('sequelize');
 const Robot = require('../models/Robot');
+const { logConnChange } = require('./connectionLogger');
+const Log   = require('../models/Log');
 
 // AMR Push Monitoring Service
 // - Listens on TCP port for robot push data
@@ -11,6 +13,26 @@ const Robot = require('../models/Robot');
 const PUSH_PORT = 19301;
 const sockets = new Map();
 const lastRecTime = new Map();
+
+(async () => {
+    try {
+        console.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        const robots = await Robot.findAll({ attributes: ['name'] });
+      console.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+      console.log(robots[0].name)
+     for (const { name } of robots) {
+       await Log.create({
+         type: 'CONN',
+         message: `AMR:${name}`,
+         robot_name: name,
+         status: 'server-on',
+       });
+     }
+    } catch (e) {
+      console.error('[AMR] initial log error:', e.message);
+    }
+  })();
 
 async function markDisconnectedByIp(ip) {
     try {
@@ -55,9 +77,9 @@ function handlePush(sock, ip) {
             let json;
             try {
                 json = JSON.parse(payload);
-                console.log(ip, json.vehicle_id)
+                //console.log(ip, json.vehicle_id)
             }
-            catch (err) { console.log('failed to json', ip, err, payload); continue; }
+            catch (err) { continue;}//console.log('failed to json', ip, err, payload); continue; }
 
             const name = json.vehicle_id || json.robot_id;
             if (!name) continue;

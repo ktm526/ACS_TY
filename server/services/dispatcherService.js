@@ -172,6 +172,12 @@ exports.sendGotoNav = sendGotoNav;
 /* ─────────────── 5. RIO 연결 & 폴링 (edge 감지용) ────────────────── */
 
 (async () => {
+  for (const ip of Object.keys(RIOS)) {
+    await Log.create({
+      type: 'CONN',
+      message: `RIO:${ip}`,
+      status: 'server-on',
+    });}
   // 초기 연결: 서비스 부트 시 한 번씩 시도
   for (const [ip, dev] of Object.entries(RIOS)) {
     try {
@@ -244,7 +250,8 @@ async function pollAllRios() {
         lastRioSignal.set(ip, Date.now());
 
         dev.lastRegs = data;
-        console.log(DataTypes)
+        console.log(data)
+        //console.log(DataTypes)
         for (const [idx, r] of Object.entries(dev.routes)) {
           r.prev = r.curr;
           r.curr = data[idx];

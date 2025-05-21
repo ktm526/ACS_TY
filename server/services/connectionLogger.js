@@ -10,6 +10,7 @@ const Log = require('../models/Log');
 const _prev = new Map();      // key → lastConnected(true/false)
 
 async function logConnChange(key, connected, meta = {}) {
+    console.log("!!!loging!!!", key, connected)
     const last = _prev.get(key);
     if (last === undefined) {                // 첫 호출이면 상태만 기억
         _prev.set(key, connected);
