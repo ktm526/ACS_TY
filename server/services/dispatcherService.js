@@ -345,9 +345,9 @@ const clearRio = async (dev, idx) => {
     // 0~6번 레지스터만 초기화
     if (regNum >= 0 && regNum <= 6) {
       await dev.client.writeRegister(regNum, 0);
-      console.log(`[RIO_CLEAR] 레지스터 ${regNum}번 초기화 완료`);
+      //console.log(`[RIO_CLEAR] 레지스터 ${regNum}번 초기화 완료`);
     } else {
-      console.log(`[RIO_CLEAR] 레지스터 ${regNum}번은 초기화 범위(0~6) 밖이므로 건너뜀`);
+      //console.log(`[RIO_CLEAR] 레지스터 ${regNum}번은 초기화 범위(0~6) 밖이므로 건너뜀`);
     }
   } catch (e) {
     console.error(`[RIO_CLEAR] 레지스터 ${idx}번 초기화 오류: ${e.message}`);
@@ -472,7 +472,7 @@ async function checkRobotTaskStatus(robot) {
   const existingTask = await Task.findOne({
     where: {
       robot_id: robot.id,
-      status: { [Op.in]: ['PENDING', 'RUNNING'] }
+      status: { [Op.in]: ['PENDING', 'RUNNING', 'PAUSED'] }
     },
     order: [['id', 'DESC']]
   });
@@ -1401,6 +1401,18 @@ async function handleCancelSignal(robot) {
       
       console.log(`[CANCEL_HANDLER] ${robot.name}: 태스크 취소 완료`);
       await log('TASK_CANCEL', `${robot.name}: 사용자 취소 신호`, { robot_name: robot.name });
+      
+      // RIO 레지스터 17번을 0으로 설정 (취소 신호)
+      try {
+        // 모든 RIO IP에 대해 레지스터 17번 설정
+        const allRioIPs = ['192.168.0.5', '192.168.0.6'];
+        for (const rioIP of allRioIPs) {
+          await setRioRegister17(rioIP, false);
+          console.log(`[CANCEL_HANDLER] ${robot.name}: RIO 레지스터 17번을 0으로 설정 완료 (${rioIP})`);
+        }
+      } catch (error) {
+        console.error(`[CANCEL_HANDLER] ${robot.name}: RIO 레지스터 설정 오류 - ${error.message}`);
+      }
     }
     
     // 4. DI 12번을 false로 리셋 (태스크 유무와 관계없이 항상 수행)
@@ -1449,6 +1461,18 @@ async function handleRestartSignal(robot) {
       if (runningTask.status === 'PAUSED') {
         await runningTask.update({ status: 'RUNNING' });
         console.log(`[RESTART_HANDLER] ${robot.name}: 태스크 상태를 PAUSED → RUNNING으로 변경`);
+        
+        // RIO 레지스터 17번을 0으로 설정 (재개 신호)
+        try {
+          // 모든 RIO IP에 대해 레지스터 17번 설정
+          const allRioIPs = ['192.168.0.5', '192.168.0.6'];
+          for (const rioIP of allRioIPs) {
+            await setRioRegister17(rioIP, false);
+            console.log(`[RESTART_HANDLER] ${robot.name}: RIO 레지스터 17번을 0으로 설정 완료 (${rioIP})`);
+          }
+        } catch (error) {
+          console.error(`[RESTART_HANDLER] ${robot.name}: RIO 레지스터 설정 오류 - ${error.message}`);
+        }
       }
       
       // 3. 현재 스텝 명령 재전송
@@ -1561,6 +1585,18 @@ async function checkTaskPauseConditions(robot, now) {
       console.log(`[TASK_PAUSE] ${robot.name}: ${reason} - 태스크 일시정지`);
       await runningTask.update({ status: 'PAUSED' });
       await log('TASK_PAUSE', `${robot.name}: ${reason}`, { robot_name: robot.name });
+      
+      // RIO 레지스터 17번을 1로 설정 (일시정지 신호)
+      try {
+        // 모든 RIO IP에 대해 레지스터 17번 설정
+        const allRioIPs = ['192.168.0.5', '192.168.0.6'];
+        for (const rioIP of allRioIPs) {
+          await setRioRegister17(rioIP, true);
+          console.log(`[TASK_PAUSE] ${robot.name}: RIO 레지스터 17번을 1로 설정 완료 (${rioIP})`);
+        }
+      } catch (error) {
+        console.error(`[TASK_PAUSE] ${robot.name}: RIO 레지스터 설정 오류 - ${error.message}`);
+      }
     }
     
   } catch (error) {
