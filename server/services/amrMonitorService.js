@@ -61,7 +61,7 @@ function handlePush(sock, ip) {
 
     sock.on('data', async chunk => {
         buf = Buffer.concat([buf, chunk]);
-        console.log('ip====', ip)
+        //console.log('ip====', ip)
 
         while (buf.length >= 16) {
             if (buf.readUInt8(0) !== 0x5A) {
@@ -102,26 +102,165 @@ function handlePush(sock, ip) {
                     ? json.finished_path.slice(-1)[0]
                     : null
                 );
-            const battery = typeof json.battery_level === 'number'
-                ? json.battery_level * 100 : null;
-            const voltage = typeof json.voltage === 'number'
-                ? json.voltage : null;
-            const currentMap = json.current_map || null;
+            
+            // 수정된 필드 추출 로직
+            const battery = (typeof json.battery_level === 'number')
+                ? Math.round(json.battery_level * 100) // 0.97 → 97%
+                : null;
+            
+            const voltage = (typeof json.voltage === 'number')
+                ? json.voltage
+                : null;
+            
+            const current_map = json.current_map || null;
+            
+            // AMR 위치 정보
             const pos = {
                 x: json.x ?? json.position?.x ?? 0,
                 y: json.y ?? json.position?.y ?? 0,
                 angle: json.angle ?? json.position?.yaw ?? 0,
+                qw: json.qw ?? 0,
+                qx: json.qx ?? 0,
+                qy: json.qy ?? 0,
+                qz: json.qz ?? 0,
+                roll: json.roll ?? 0,
+                pitch: json.pitch ?? 0,
+                yaw: json.yaw ?? json.angle ?? 0,
+                block_x: json.block_x ?? 0,
+                block_y: json.block_y ?? 0,
             };
+            
+            // Jack 정보
+            const jackInfo = json.jack || {};
+            const jackHeight = jackInfo.jack_height ?? 0;
+            const jackState = jackInfo.jack_state ?? 0;
+            const jackEnabled = jackInfo.jack_enable ?? false;
+            
+            // 기타 정보
+            const current = (typeof json.current === 'number') ? json.current : null;
+            const isCharging = json.charging === true;
+            const isEmergency = json.emergency === true;
+            
+            // 속도 정보
+            const vx = json.vx ?? 0;
+            const vy = json.vy ?? 0;
+            const w = json.w ?? 0;
+            
+            // 로봇 상태 정보 
+            const batteryTemp = json.battery_temp ?? 0;
+            const taskStatus = json.task_status ?? 0;
+            const runningStatus = json.running_status ?? 0;
+            const blocked = json.blocked === true;
+            const slowed = json.slowed === true;
+            const confidence = json.confidence ?? 0;
+            
+            // DI/DO 센서 정보 추출 (실제 로봇 JSON 구조에 맞춤)
+            const diSensors = json.DI || json.dI || json.di || json.digitalInputs || json.digital_inputs || [];
+            const doSensors = json.DO || json.dO || json.do || json.digitalOutputs || json.digital_outputs || [];
+            
+            // 모터 정보 추출
+            const motorInfo = json.motor_info || [];
+            
+            // 추가 센서/상태 정보
+            const imuData = {
+                acc_x: json.acc_x ?? 0,
+                acc_y: json.acc_y ?? 0,
+                acc_z: json.acc_z ?? 0,
+                pitch: json.pitch ?? 0,
+                roll: json.roll ?? 0,
+                yaw: json.yaw ?? 0
+            };
+            
+            const controllerInfo = {
+                temp: json.controller_temp ?? 0,
+                humidity: json.controller_humi ?? 0,
+                voltage: json.controller_voltage ?? 0
+            };
+            
+            const next_location = json.next_station || json.nextStation || 
+                                  (json.target_id ? json.target_id : null);
 
             const payloadForDb = {
                 name,
                 status: statusStr,
                 location,
-                next_location: json.next_station || json.nextStation || null,
+                next_location: next_location,
                 task_step: json.task_step || json.taskStep || null,
-                battery, voltage, current_map: currentMap,
+                battery, 
+                voltage, 
+                current_map: current_map,
                 position: JSON.stringify(pos),
-                additional_info: JSON.stringify(json),
+                additional_info: JSON.stringify({
+                    // 핵심 상태 정보
+                    jackHeight,
+                    jackState,
+                    jackEnabled,
+                    jackError: jackInfo.jack_error_code ?? 0,
+                    current,
+                    charging: isCharging,
+                    emergency: isEmergency,
+                    batteryTemp,
+                    
+                    // 이동 정보
+                    vx,
+                    vy,
+                    w,
+                    odo: json.odo ?? 0,
+                    blocked,
+                    slowed,
+                    confidence,
+                    
+                    // 작업 정보
+                    runningStatus,
+                    taskStatus,
+                    targetId: json.target_id,
+                    targetLabel: json.target_label,
+                    
+                    // 장치 정보
+                    rollerInfo: json.roller,
+                    hookInfo: json.hook,
+                    nearestObstacles: json.nearest_obstacles,
+                    errors: json.errors,
+                    warnings: json.warnings,
+                    
+                    // DI/DO 센서 정보 (실제 로봇 구조)
+                    diSensors: diSensors,
+                    doSensors: doSensors,
+                    
+                    // 모터 정보
+                    motorInfo: motorInfo,
+                    
+                    // IMU 센서 정보
+                    imuData: imuData,
+                    
+                    // 컨트롤러 정보
+                    controllerInfo: controllerInfo,
+                    
+                    // 기타 상태 정보
+                    autoCharge: json.auto_charge ?? false,
+                    manualCharge: json.manual_charge ?? false,
+                    electric: json.electric ?? false,
+                    brake: json.brake ?? false,
+                    isStop: json.is_stop ?? false,
+                    inForbiddenArea: json.in_forbidden_area ?? false,
+                    
+                    // 위치/맵 관련
+                    currentMapMd5: json.current_map_md5,
+                    locMethod: json.loc_method ?? 0,
+                    locState: json.loc_state ?? 0,
+                    similarity: json.similarity ?? 0,
+                    
+                    // 시간 정보
+                    todayOdo: json.today_odo ?? 0,
+                    todayTime: json.today_time ?? 0,
+                    totalTime: json.total_time ?? 0,
+                    
+                    // 버전 정보
+                    version: json.version,
+                    model: json.model,
+                    dspVersion: json.dsp_version,
+                    gyroVersion: json.gyro_version,
+                }),
                 timestamp: new Date(),
             };
 

@@ -17,6 +17,7 @@ import {
   message,
   Steps,
   Empty,
+  Progress,
 } from "antd";
 import { PlusOutlined, DeleteOutlined } from "@ant-design/icons";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -29,6 +30,7 @@ const API = import.meta.env.VITE_CORE_BASE_URL;
 const STATUS_BADGE = {
   이동: "processing",
   대기: "success",
+  충전: "warning",
   오류: "error",
   "연결 끊김": "warning",
   unknown: "default",
@@ -36,6 +38,7 @@ const STATUS_BADGE = {
 const STATUS_TAG_COLOR = {
   이동: "blue",
   대기: "green",
+  충전: "orange",
   오류: "red",
   "연결 끊김": "orange",
   unknown: "default",
@@ -50,6 +53,27 @@ export default function AMRStatus() {
   const [selectedAmr, setSelectedAmr] = useState(null);
   const [hoveredId, setHoveredId] = useState(null);
   const [form] = Form.useForm();
+
+  // AMR 상태 결정 함수
+  const getAmrStatus = (amr) => {
+    // additional_info에서 charging 상태 확인
+    let additionalInfo = {};
+    try {
+      additionalInfo = typeof amr.additional_info === 'string' 
+        ? JSON.parse(amr.additional_info) 
+        : amr.additional_info || {};
+    } catch (e) {
+      // JSON 파싱 실패 시 빈 객체 사용
+    }
+    
+    // charging이 true이면 '충전' 상태로 표시
+    if (additionalInfo.charging === true) {
+      return '충전';
+    }
+    
+    // 기존 상태 반환
+    return amr.status || 'unknown';
+  };
 
   // 1) AMR 리스트
   const amrQuery = useQuery({
@@ -111,6 +135,41 @@ export default function AMRStatus() {
   const showDetail = (amr) => {
     setSelectedAmr(amr);
     setDetailVisible(true);
+  };
+
+  // 화물 상태 확인 함수
+  const getCargoStatus = (amr) => {
+    let additionalInfo = {};
+    try {
+      additionalInfo = typeof amr.additional_info === 'string' 
+        ? JSON.parse(amr.additional_info) 
+        : amr.additional_info || {};
+    } catch (e) {
+      return { hasCargo: false, sensors: [] };
+    }
+    
+    const diSensors = additionalInfo.diSensors || [];
+    const sensor4 = diSensors.find(s => s.id === 4);
+    const sensor5 = diSensors.find(s => s.id === 5);
+    
+    const hasCargo = sensor4?.status === true && sensor5?.status === true;
+    
+    return {
+      hasCargo,
+      sensors: diSensors,
+      sensor4Status: sensor4?.status || false,
+      sensor5Status: sensor5?.status || false
+    };
+  };
+
+  // JSON 포맷팅 함수
+  const formatJsonForDisplay = (jsonString) => {
+    try {
+      const parsed = typeof jsonString === 'string' ? JSON.parse(jsonString) : jsonString;
+      return JSON.stringify(parsed, null, 2);
+    } catch (e) {
+      return jsonString || "없음";
+    }
   };
 
   // ──────────────────────────────────────────────────────────────
@@ -192,7 +251,7 @@ export default function AMRStatus() {
         title={`Task #${data.task_id}`}
         extra={
           <Space size="small">
-             {data?.paused ? (
+             {/* {data?.paused ? (
      <Button
        size="small"
        onClick={() => resumeMut.mutate()}
@@ -207,7 +266,7 @@ export default function AMRStatus() {
         loading={pauseMut.isLoading}
       >
         일시정지
-      </Button>)}
+      </Button>)} */}
             <Button
               danger
               size="small"
@@ -252,7 +311,7 @@ export default function AMRStatus() {
           >
             {amrQuery.data?.map((amr) => {
               const border =
-                token[`color${STATUS_TAG_COLOR[amr.status]}`] ||
+                token[`color${STATUS_TAG_COLOR[getAmrStatus(amr)]}`] ||
                 token.colorBorder;
               const hover = hoveredId === amr.id;
               return (
@@ -274,7 +333,7 @@ export default function AMRStatus() {
                   }}
                 >
                   <Badge
-                    status={STATUS_BADGE[amr.status]}
+                    status={STATUS_BADGE[getAmrStatus(amr)]}
                     style={{ marginRight: token.marginXXS }}
                   />
                   <span
@@ -285,8 +344,8 @@ export default function AMRStatus() {
                   >
                     {amr.name}
                   </span>
-                  <Tag size="small" color={STATUS_TAG_COLOR[amr.status]}>
-                    {amr.status}
+                  <Tag size="small" color={STATUS_TAG_COLOR[getAmrStatus(amr)]}>
+                    {getAmrStatus(amr)}
                   </Tag>
                 </Button>
               );
@@ -368,8 +427,8 @@ export default function AMRStatus() {
                   {selectedAmr.ip}
                 </Descriptions.Item>
                 <Descriptions.Item label="상태">
-                  <Tag color={STATUS_TAG_COLOR[selectedAmr.status]}>
-                    {selectedAmr.status}
+                  <Tag color={STATUS_TAG_COLOR[getAmrStatus(selectedAmr)]}>
+                    {getAmrStatus(selectedAmr)}
                   </Tag>
                 </Descriptions.Item>
                 <Descriptions.Item label="모드">
@@ -390,6 +449,59 @@ export default function AMRStatus() {
                 <Descriptions.Item label="작업 단계">
                   {selectedAmr.task_step || "-"}
                 </Descriptions.Item>
+                <Descriptions.Item label="배터리">
+                  <Space>
+                    <Progress 
+                      type="circle" 
+                      percent={selectedAmr.battery} 
+                      width={40}
+                      status={selectedAmr.battery < 20 ? "exception" : "normal"}
+                    />
+                    <Text>{selectedAmr.battery}%</Text>
+                    {selectedAmr.voltage && (
+                      <Text type="secondary">({selectedAmr.voltage}V)</Text>
+                    )}
+                    {(() => {
+                      // additional_info에서 charging 상태 확인
+                      let additionalInfo = {};
+                      try {
+                        additionalInfo = typeof selectedAmr.additional_info === 'string' 
+                          ? JSON.parse(selectedAmr.additional_info) 
+                          : selectedAmr.additional_info || {};
+                      } catch (e) {
+                        // JSON 파싱 실패 시 빈 객체 사용
+                      }
+                      
+                      if (additionalInfo.charging === true) {
+                        return (
+                          <Tag color="orange" size="small">
+                            ⚡ 충전중
+                          </Tag>
+                        );
+                      }
+                      return null;
+                    })()}
+                  </Space>
+                </Descriptions.Item>
+                <Descriptions.Item label="화물 상태">
+                  {(() => {
+                    const cargoStatus = getCargoStatus(selectedAmr);
+                    return (
+                      <Space>
+                        <Tag 
+                          color={cargoStatus.hasCargo ? "green" : "default"}
+                          icon={cargoStatus.hasCargo ? "📦" : "📭"}
+                        >
+                          {cargoStatus.hasCargo ? "화물 있음" : "화물 없음"}
+                        </Tag>
+                        <Text type="secondary" style={{ fontSize: '12px' }}>
+                          (DI4: {cargoStatus.sensor4Status ? 'ON' : 'OFF'}, 
+                           DI5: {cargoStatus.sensor5Status ? 'ON' : 'OFF'})
+                        </Text>
+                      </Space>
+                    );
+                  })()}
+                </Descriptions.Item>
                 <Descriptions.Item label="좌표">
                   <Paragraph code copyable>
                     {selectedAmr.position}
@@ -407,7 +519,7 @@ export default function AMRStatus() {
                       overflow: "auto",
                     }}
                   >
-                    {selectedAmr.additional_info || "없음"}
+                    {formatJsonForDisplay(selectedAmr.additional_info)}
                   </Paragraph>
                 </Panel>
               </Collapse>
