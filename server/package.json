@@ -19,6 +19,7 @@
     "js-yaml": "^4.1.0",
     "modbus-serial": "^8.0.21-no-serial-port",
     "multer": "^1.4.5-lts.2",
+    "node-cron": "^4.1.0",
     "path": "^0.12.7",
     "sequelize": "^6.37.7",
     "sqlite3": "^5.1.7"

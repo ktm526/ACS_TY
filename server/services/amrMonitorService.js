@@ -37,7 +37,7 @@ const lastRecTime = new Map();
 async function markDisconnectedByIp(ip) {
     try {
         await Robot.update(
-            { status: '연결 안됨', timestamp: new Date() },
+            { status: '연결 끊김', timestamp: new Date() },
             { where: { ip } }
         );
     } catch (e) {
@@ -48,7 +48,7 @@ async function markDisconnectedByIp(ip) {
 async function markDisconnectedByName(name) {
     try {
         await Robot.update(
-            { status: '연결 안됨', timestamp: new Date() },
+            { status: '연결 끊김', timestamp: new Date() },
             { where: { name } }
         );
     } catch (e) {

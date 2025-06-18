@@ -20,6 +20,14 @@ const MapDB             = require('../models/Map');
 const { sendGotoNav }     = require('./navService');
 const { sendJackCommand } = require('./robotJackService');
 const JACK_CODES          = require('../controllers/jackController').CODES;
+const {
+  logTaskStarted,
+  logStepStarted,
+  logStepCompleted,
+  logStepFailed,
+  logTaskCompleted,
+  logTaskFailed
+} = require('./taskExecutionLogger');
 
 // 순환 참조 문제 해결을 위해 직접 참조 대신 함수로 가져오기
 let RIOS;
@@ -43,6 +51,49 @@ const STEP_TIMEOUT_MS = 1_800_000;    // 30분
 
 /* ───────────────────── helper functions ───────────────────────────── */
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/* ──────────────────── AMR Manual/Auto 모드 체크 함수 ─────────────────── */
+function checkRobotAutoMode(robot) {
+  try {
+    // robot.additional_info에서 DI 센서 정보 추출
+    let additionalInfo = {};
+    if (robot.additional_info) {
+      additionalInfo = typeof robot.additional_info === 'string'
+        ? JSON.parse(robot.additional_info)
+        : robot.additional_info;
+    }
+    
+    // DI 센서 정보 가져오기
+    const diSensors = additionalInfo.diSensors || [];
+    
+    // DI 11번 센서 찾기 (자동/수동 모드)
+    const di11 = diSensors.find(s => s.id === 11);
+    
+    if (!di11) {
+      // DI 11번 센서 정보가 없으면 기본적으로 자동 모드로 가정
+      console.log(`[AUTO_MODE_CHECK] ${robot.name}: DI 11번 센서 정보 없음, 자동 모드로 가정`);
+      return true;
+    }
+    
+    // DI 11번이 false이면 자동, true이면 수동
+    const isAutoMode = di11.status === false;
+    const modeText = isAutoMode ? '자동' : '수동';
+    
+    // 로그는 모드가 변경될 때만 출력 (너무 많은 로그 방지)
+    const lastMode = robot._lastMode || true; // 기본값은 자동
+    if (lastMode !== isAutoMode) {
+      console.log(`[AUTO_MODE_CHECK] ${robot.name}: 모드 변경 감지 - ${modeText} 모드`);
+      robot._lastMode = isAutoMode; // 마지막 모드 저장
+    }
+    
+    return isAutoMode;
+    
+  } catch (error) {
+    console.error(`[AUTO_MODE_CHECK] ${robot.name}: DI 센서 정보 파싱 오류 - ${error.message}`);
+    // 오류 발생 시 기본적으로 자동 모드로 가정
+    return true;
+  }
+}
 
 /* ───────────────────── waitUntil helper ──────────────────────────── */
 const waitUntil = (cond, ms, taskId) => new Promise((resolve) => {
@@ -143,18 +194,59 @@ async function runStep(task, robot, step) {
 
   console.log(`  ↪ [RUN] task#${task.id} seq=${step.seq} (${step.type})`);
 
+  // 스텝 시작 로그 기록 (PENDING에서 RUNNING으로 변경될 때만)
+  const stepStartTime = new Date();
+  const isFirstRun = step.status === 'PENDING';
+  
+  try {
+    if (isFirstRun) {
+      // NAV/NAV_PRE 스텝인 경우 출발지와 목적지 정보 추가
+      if (step.type === 'NAV' || step.type === 'NAV_PRE') {
+        // 맵 정보와 스테이션 정보 가져오기
+        const mapRow = await MapDB.findOne({ where: { is_current: true } });
+        const stations = JSON.parse(mapRow.stations || '{}').stations || [];
+        
+        // 현재 위치 스테이션 찾기
+        const fromStation = stations.find(s => String(s.id) === String(robot.location));
+        const toStation = stations.find(s => String(s.id) === String(payload.dest));
+        
+        const fromLocationName = fromStation ? fromStation.name : robot.location;
+        const toLocationName = toStation ? toStation.name : payload.dest;
+        
+        await logStepStarted(task.id, robot.id, robot.name, step.seq, step.type, payload, fromLocationName, toLocationName);
+      } else {
+        await logStepStarted(task.id, robot.id, robot.name, step.seq, step.type, payload);
+      }
+    }
+  } catch (error) {
+    console.error('[TASK_LOG] 스텝 시작 로그 기록 오류:', error.message);
+  }
+
   // ─ NAV_PRE: just send once, no wait
   if (step.type === 'NAV_PRE') {
     console.log(`    ▶ NAV PRE send → dest=${payload.dest}`);
     
-    // 같은 지역의 다른 AMR이 '이동' 중이면 대기 (교차 이동은 제외)
+    // 맵과 스테이션 정보 로드
     const mapRow = await MapDB.findOne({ where: { is_current: true } });
     const stations = JSON.parse(mapRow.stations || '{}').stations || [];
+    
+    // 목적지 스테이션 찾기 및 destination 업데이트
+    const destStation = stations.find(s => String(s.id) === String(payload.dest));
+    if (destStation) {
+      await Robot.update(
+        { destination: destStation.name },
+        { where: { id: robot.id } }
+      );
+      console.log(`    ▶ Robot destination 업데이트: ${destStation.name}`);
+    } else {
+      console.log(`    ▶ 목적지 스테이션을 찾을 수 없음: ${payload.dest}`);
+    }
+    
+    // 같은 지역의 다른 AMR이 '이동' 중이면 대기 (교차 이동은 제외)
     const allRobots = await Robot.findAll();
     
     // 현재 로봇의 위치와 목적지의 지역 확인
     const currentStation = stations.find(s => String(s.id) === String(robot.location));
-    const destStation = stations.find(s => String(s.id) === String(payload.dest));
     
     const currentRegion = currentStation ? regionOf(currentStation) : null;
     const destRegion = destStation ? regionOf(destStation) : null;
@@ -234,14 +326,27 @@ async function runStep(task, robot, step) {
   if (step.type === 'NAV') {
     console.log(`    ▶ NAV send → dest=${payload.dest}`);
     
-    // 같은 지역의 다른 AMR이 '이동' 중이면 대기 (교차 이동은 제외)
+    // 맵과 스테이션 정보 로드
     const mapRow = await MapDB.findOne({ where: { is_current: true } });
     const stations = JSON.parse(mapRow.stations || '{}').stations || [];
+    
+    // 목적지 스테이션 찾기 및 destination 업데이트
+    const destStation = stations.find(s => String(s.id) === String(payload.dest));
+    if (destStation) {
+      await Robot.update(
+        { destination: destStation.name },
+        { where: { id: robot.id } }
+      );
+      console.log(`    ▶ Robot destination 업데이트: ${destStation.name}`);
+    } else {
+      console.log(`    ▶ 목적지 스테이션을 찾을 수 없음: ${payload.dest}`);
+    }
+    
+    // 같은 지역의 다른 AMR이 '이동' 중이면 대기 (교차 이동은 제외)
     const allRobots = await Robot.findAll();
     
     // 현재 로봇의 위치와 목적지의 지역 확인
     const currentStation = stations.find(s => String(s.id) === String(robot.location));
-    const destStation = stations.find(s => String(s.id) === String(payload.dest));
     
     const currentRegion = currentStation ? regionOf(currentStation) : null;
     const destRegion = destStation ? regionOf(destStation) : null;
@@ -522,26 +627,169 @@ if (step.type === 'WAIT_FREE_PATH') {
     const pathSts    = stations.filter(s => hasClass(s, '경로'));
     const allRobots  = await Robot.findAll();
     const otherRobots = allRobots.filter(r => r.id !== robot.id);
-  
-    const blocked = pathSts.some(ps =>
-      otherRobots.some(r => String(r.location) === String(ps.id))
-    );
-    console.log(`    ▶ WAIT_FREE_PATH blocked=${blocked}`);
+    
+    // 현재 로봇의 위치 확인
+    const currentSt = stations.find(s => String(s.id) === String(robot.location));
+    
+    // 대기 스테이션에 있는지 확인
+    const isAtWaitingStation = currentSt && hasClass(currentSt, '대기');
+    
+    // 클래스 기반 차단 체크 (대기 스테이션에 있든 없든 동일한 로직 적용)
+    let blocked = false;
+    const blockingRobots = [];
+    const myClasses = currentSt ? getCls(currentSt) : [];
+    
+    if (isFirstRun) {
+      console.log(`    ▶ [DEBUG] 현재 위치: ${currentSt ? currentSt.name : 'Unknown'}, 클래스=[${myClasses.join(', ')}], 대기스테이션=${isAtWaitingStation}`);
+    }
+    
+    for (const ps of pathSts) {
+      const robotOnPath = otherRobots.find(r => String(r.location) === String(ps.id));
+      if (robotOnPath) {
+        // 해당 로봇의 목적지 확인
+        const robotDestination = robotOnPath.destination;
+        
+        if (isFirstRun) {
+          console.log(`    ▶ [DEBUG] 경로 위 로봇 ${robotOnPath.name}: destination="${robotDestination}"`);
+        }
+        
+        if (robotDestination) {
+          // 목적지 스테이션 찾기 (이름으로 먼저 시도, 실패하면 ID로 시도)
+          let destStation = stations.find(s => s.name === robotDestination);
+          if (!destStation) {
+            destStation = stations.find(s => String(s.id) === String(robotDestination));
+            if (isFirstRun) {
+              console.log(`    ▶ [DEBUG] 이름으로 찾기 실패, ID로 찾기 시도: ${destStation ? '성공' : '실패'}`);
+            }
+          }
+          
+          if (destStation) {
+            const destClasses = getCls(destStation);
+            
+            if (isFirstRun) {
+              console.log(`    ▶ [DEBUG] 목적지 스테이션 ${destStation.name}: 클래스=[${destClasses.join(', ')}]`);
+              console.log(`    ▶ [DEBUG] 현재 로봇 클래스=[${myClasses.join(', ')}]`);
+            }
+            
+            // 목적지 클래스가 현재 로봇의 클래스와 겹치는지 확인
+            const hasCommonClass = myClasses.some(myClass => destClasses.includes(myClass));
+            
+            if (isFirstRun) {
+              console.log(`    ▶ [DEBUG] 공통 클래스 있음: ${hasCommonClass}`);
+            }
+            
+            if (hasCommonClass) {
+              blocked = true;
+              blockingRobots.push({
+                robot: robotOnPath.name,
+                location: ps.name,
+                destination: destStation.name,
+                commonClasses: myClasses.filter(c => destClasses.includes(c))
+              });
+              
+              if (isFirstRun) {
+                console.log(`    ▶ [DEBUG] 로봇 ${robotOnPath.name}으로 인해 차단됨`);
+              }
+            } else {
+              if (isFirstRun) {
+                console.log(`    ▶ 경로 위 로봇 ${robotOnPath.name} (${ps.name}): 목적지 ${destStation.name} 클래스가 다르므로 무시`);
+              }
+            }
+          } else {
+            if (isFirstRun) {
+              console.log(`    ▶ 경로 위 로봇 ${robotOnPath.name}: 목적지 스테이션을 찾을 수 없음 (${robotDestination})`);
+            }
+          }
+        } else {
+          // 목적지가 없는 로봇은 기존처럼 차단으로 간주
+          blocked = true;
+          blockingRobots.push({
+            robot: robotOnPath.name,
+            location: ps.name,
+            destination: '목적지 없음',
+            commonClasses: ['목적지 미설정']
+          });
+          
+          if (isFirstRun) {
+            console.log(`    ▶ [DEBUG] 로봇 ${robotOnPath.name}: 목적지가 없어 차단됨`);
+          }
+        }
+      }
+    }
+    
+    // 처음 실행될 때만 상세 로그 출력
+    if (isFirstRun) {
+      console.log(`    ▶ WAIT_FREE_PATH 시작: 현재 로봇 클래스=[${myClasses.join(', ')}], 차단 상태=${blocked}${isAtWaitingStation ? ' (대기스테이션)' : ''}`);
+      
+      if (blocked && blockingRobots.length > 0) {
+        console.log(`    ▶ 차단하는 로봇들:`);
+        blockingRobots.forEach(info => {
+          console.log(`      - ${info.robot} (${info.location}): 목적지 ${info.destination}, 공통 클래스=[${info.commonClasses.join(', ')}]`);
+        });
+      }
+    } else {
+      // 대기 중일 때는 간단한 로그만 출력
+      console.log(`    ▶ WAIT_FREE_PATH 대기 중... blocked=${blocked} (차단 로봇: ${blockingRobots.length}개)${isAtWaitingStation ? ' (대기스테이션)' : ''}`);
+    }
   
     if (blocked) {
-      // 2) Only *then* if we're still sitting in an IC, redirect to 대기
-      const currentSt = stations.find(s => String(s.id) === String(robot.location));
-      if (currentSt && hasClass(currentSt, 'IC') && currentSt.name !== 'LM73' &&String(currentSt.id) !== 'LM73') {
+      // 2) Check if we're at an IC station and need to move to waiting area
+      if (currentSt && hasClass(currentSt, 'IC') && currentSt.name !== 'LM73' && String(currentSt.id) !== 'LM73') {
         const waitSt = stations.find(s =>
           hasClass(s, '대기') &&
           regionOf(s) === regionOf(currentSt)
         );
+        
         if (waitSt) {
-          console.log(
-            `    ▶ WAIT_FREE_PATH: path blocked and at IC(${currentSt.name}) → ` +
-            `redirecting to 대기(${waitSt.name})`
-          );
+          // Check if robot is already at the waiting station
+          if (String(robot.location) === String(waitSt.id)) {
+            console.log(`    ▶ WAIT_FREE_PATH: 이미 대기 스테이션(${waitSt.name})에 있음, 경로 클리어 대기 중`);
+            return false; // Continue waiting for path to clear
+          }
+          
+          // Robot is at IC but not at waiting station - send to waiting station
+          if (isFirstRun) {
+            console.log(
+              `    ▶ WAIT_FREE_PATH: path blocked and at IC(${currentSt.name}) → ` +
+              `redirecting to 대기(${waitSt.name})`
+            );
+          }
+          
+          // Send navigation command to waiting station
           await sendGotoNav(robot.ip, waitSt.id, 'SELF_POSITION', `${Date.now()}`);
+          
+          // Wait for robot to reach the waiting station
+          const reachedWaiting = await waitUntil(async () => {
+            const fresh = await Robot.findByPk(robot.id);
+            if (!fresh) {
+              console.log(`    ▶ [DEBUG] 로봇 정보를 찾을 수 없음: robot.id=${robot.id}`);
+              return false;
+            }
+            
+            const currentLoc = fresh.location;
+            const targetLoc = waitSt.id;
+            
+            if (currentLoc == null || targetLoc == null) {
+              console.log(`    ▶ [DEBUG] 위치 정보 누락: 현재=${currentLoc}, 목표=${targetLoc}`);
+              return false;
+            }
+            
+            return String(currentLoc) === String(targetLoc);
+          }, STEP_TIMEOUT_MS, task.id);
+          
+          if (reachedWaiting === 'INTERRUPTED') {
+            console.log(`    ▶ 대기 스테이션 이동이 중단되었습니다 (태스크 상태 변경)`);
+            return false;
+          }
+          
+          if (!reachedWaiting) {
+            console.log(`    ▶ 대기 스테이션 이동 타임아웃`);
+            return false; // Continue trying next tick
+          }
+          
+          console.log(`    ▶ 대기 스테이션(${waitSt.name}) 도착 완료`);
+          // Now continue to wait for path to clear
+          return false;
         }
       }
       // still busy, stay in this step
@@ -549,6 +797,9 @@ if (step.type === 'WAIT_FREE_PATH') {
     }
   
     // 3) path is clear → complete this step
+    if (isFirstRun) {
+      console.log(`    ▶ WAIT_FREE_PATH 완료: 경로가 클리어되었습니다.`);
+    }
     return true;
   }
   
@@ -888,7 +1139,7 @@ if (step.type === 'WAIT_FREE_PATH') {
           await step.update({ status: 'DONE' });
           return true;
         } else {
-          console.log(`    ▶ 사용 가능한 충전 스테이션이 없어 원래 목적지로 이동합니다.`);
+          console.log(`    ▶ 사용 가능한 충전 스테이션이 없습니다. 현재 버퍼에서 대기합니다.`);
         }
       }
       
@@ -1176,10 +1427,90 @@ if (step.type === 'WAIT_FREE_PATH') {
         return true;
       }
     } else {
-      // 빈 버퍼가 없으면 교차점(icB)에서 대기
-      console.log(`    ▶ B 지역에 빈 버퍼가 없어 현재 위치에서 대기합니다.`);
-      await step.update({ status: 'DONE' });
-      return true;
+      // 빈 버퍼가 없으면 B4 상태 확인
+      console.log(`    ▶ B 지역에 빈 버퍼가 없습니다. B4 상태 확인 중...`);
+      
+      // 1. B4에 있는 AMR 확인
+      const b4Station = stations.find(s => s.name === 'B4');
+      let robotAtB4 = null;
+      if (b4Station) {
+        robotAtB4 = robots.find(r => String(r.location) === String(b4Station.id));
+        if (robotAtB4) {
+          console.log(`    ▶ B4에 AMR이 있습니다: ${robotAtB4.name}`);
+        } else {
+          console.log(`    ▶ B4에 AMR이 없습니다.`);
+        }
+      }
+      
+      // 2. 목적지가 B4인 다른 AMR 확인 (현재 로봇 제외)
+      const { checkDestinationConflict } = require('./dispatcherService');
+      const hasB4Conflict = !(await checkDestinationConflict(b4Station?.id, robot.id));
+      
+      if (hasB4Conflict) {
+        console.log(`    ▶ 목적지가 B4인 다른 AMR이 있습니다.`);
+      } else {
+        console.log(`    ▶ 목적지가 B4인 다른 AMR이 없습니다.`);
+      }
+      
+      // 3. 결정 로직
+      if (robotAtB4 || hasB4Conflict) {
+        // B4에 AMR이 있거나 목적지가 B4인 다른 AMR이 있으면 B 지역 대기 스테이션으로 이동
+        console.log(`    ▶ B4가 점유되어 있어 B 지역 대기 스테이션으로 이동합니다.`);
+        
+        // B 지역의 '대기' 스테이션 찾기
+        const bWaitStation = stations.find(s => 
+          regionOf(s) === 'B' && hasClass(s, '대기')
+        );
+        
+        if (bWaitStation) {
+          console.log(`    ▶ B 지역 대기 스테이션 ${bWaitStation.name}으로 이동합니다.`);
+          
+          // 현재 로봇이 이미 대기 스테이션에 있는지 확인
+          const isAlreadyAtWaitStation = String(robot.location) === String(bWaitStation.id);
+          
+          if (isAlreadyAtWaitStation) {
+            // 이미 대기 스테이션에 있으면 스텝을 완료하지 않고 다음 tick에서 재확인
+            console.log(`    ▶ 이미 B 지역 대기 스테이션에 있습니다. 다음 tick에서 재확인합니다.`);
+            return false;
+          } else {
+            // 대기 스테이션으로 이동
+            await TaskStep.create({
+              task_id: task.id,
+              seq: step.seq + 1,
+              type: 'NAV',
+              payload: JSON.stringify({ dest: bWaitStation.id }),
+              status: 'PENDING'
+            });
+            
+            await step.update({ status: 'DONE' });
+            return true;
+          }
+        } else {
+          console.error(`    ▶ B 지역 대기 스테이션을 찾을 수 없습니다. 현재 위치에서 대기합니다.`);
+          // 대기 스테이션을 찾을 수 없으면 다음 tick에서 다시 확인
+          return false;
+        }
+      } else {
+        // B4가 비어있고 목적지로 하는 AMR도 없으면 B4로 이동
+        console.log(`    ▶ B4가 비어있어 B4로 이동합니다.`);
+        
+        if (b4Station) {
+          await TaskStep.create({
+            task_id: task.id,
+            seq: step.seq + 1,
+            type: 'NAV',
+            payload: JSON.stringify({ dest: b4Station.id }),
+            status: 'PENDING'
+          });
+          
+          await step.update({ status: 'DONE' });
+          return true;
+        } else {
+          console.error(`    ▶ B4 스테이션을 찾을 수 없습니다.`);
+          await step.update({ status: 'DONE' });
+          return true;
+        }
+      }
     }
     
     // 문제가 발생한 경우 (빈 버퍼 없음 + 다른 오류)
@@ -1459,22 +1790,22 @@ if (step.type === 'WAIT_FREE_PATH') {
     let needsCharging = false;
     let reason = '';
     
-    if (batteryLevel <= 60) {
+    if (batteryLevel <= 50) {
       if (hasOccupiedChargeStation) {
         // 충전 스테이션이 점유되어 있으면 40% 이하일 때만 충전
         if (batteryLevel <= 40) {
           needsCharging = true;
           reason = `배터리 ${batteryLevel}% (40% 이하, 충전 스테이션 점유됨)`;
         } else {
-          reason = `배터리 ${batteryLevel}% (60% 이하이지만 충전 스테이션 점유됨, 40% 이하가 되면 충전)`;
+          reason = `배터리 ${batteryLevel}% (50% 이하이지만 충전 스테이션 점유됨, 40% 이하가 되면 충전)`;
         }
       } else {
-        // 충전 스테이션이 비어있으면 60% 이하일 때 충전
+        // 충전 스테이션이 비어있으면 50% 이하일 때 충전
         needsCharging = true;
-        reason = `배터리 ${batteryLevel}% (60% 이하, 충전 스테이션 비어있음)`;
+        reason = `배터리 ${batteryLevel}% (50% 이하, 충전 스테이션 비어있음)`;
       }
     } else {
-      reason = `배터리 ${batteryLevel}% (60% 초과, 충전 불필요)`;
+      reason = `배터리 ${batteryLevel}% (50% 초과, 충전 불필요)`;
     }
     
     console.log(`    ▶ 충전 필요성 판단: ${reason}`);
@@ -1496,7 +1827,7 @@ if (step.type === 'WAIT_FREE_PATH') {
         // 충전 스테이션으로 이동하는 단계
         let currentSeq = step.seq+1;
         const chargeSteps = [];
-
+        
         // 먼저 JACK_DOWN 수행 (버퍼에서 화물 내리기)
         chargeSteps.push({ task_id: task.id, seq: currentSeq++, type: 'JACK_DOWN',
           payload: JSON.stringify({ height: 0.0 }) });
@@ -1524,6 +1855,92 @@ if (step.type === 'WAIT_FREE_PATH') {
       console.log(`    ▶ 충전이 필요하지 않습니다.`);
     }
     
+    await step.update({ status: 'DONE' });
+    return true;
+  }
+
+  // ─ FIND_EMPTY_B_CHARGE: IC-B에 도착한 후 빈 B지역 충전소를 동적으로 찾아 이동
+  if (step.type === 'FIND_EMPTY_B_CHARGE') {
+    console.log(`    ▶ IC-B에서 빈 B지역 충전소 동적 탐색 시작`);
+    
+    const mapRow = await MapDB.findOne({ where: { is_current: true } });
+    const stations = JSON.parse(mapRow.stations||'{}').stations||[];
+    const robots = await Robot.findAll();
+    
+    // B지역 충전 스테이션들 찾기
+    const bChargeStations = stations.filter(s => 
+      regionOf(s) === 'B' && 
+      hasClass(s, '충전')
+    );
+    
+    if (bChargeStations.length === 0) {
+      console.log(`    ▶ B지역에 충전 스테이션이 없습니다.`);
+      await step.update({ status: 'FAILED', error_message: 'B지역 충전 스테이션을 찾을 수 없습니다' });
+      return true;
+    }
+    
+    console.log(`    ▶ B지역 충전 스테이션 목록: ${bChargeStations.map(s => s.name).join(', ')}`);
+    
+    // 빈 충전 스테이션 찾기
+    let emptyChargeStation = null;
+    
+    for (const chargeSt of bChargeStations) {
+      const robotAtCharge = robots.find(r => String(r.location) === String(chargeSt.id));
+      
+      if (!robotAtCharge) {
+        emptyChargeStation = chargeSt;
+        console.log(`    ▶ 빈 충전 스테이션 찾음: ${chargeSt.name}`);
+        break;
+      } else {
+        console.log(`    ▶ 충전 스테이션 ${chargeSt.name}: 로봇 ${robotAtCharge.name}이 사용 중`);
+      }
+    }
+    
+    if (!emptyChargeStation) {
+      console.log(`    ▶ 모든 B지역 충전 스테이션이 사용 중입니다. 5초 후 다시 시도합니다.`);
+      await delay(5000);
+      return false; // 스텝을 완료하지 않고 다음 tick에서 다시 시도
+    }
+    
+    // 충전 스테이션의 PRE 스테이션 찾기
+    const chargePreStation = stations.find(s => 
+      s.name === `${emptyChargeStation.name}_PRE`
+    );
+    
+    if (!chargePreStation) {
+      console.log(`    ▶ ${emptyChargeStation.name}_PRE 스테이션을 찾을 수 없습니다. 직접 충전소로 이동합니다.`);
+      
+      // PRE 스테이션이 없으면 직접 충전소로 이동
+      await TaskStep.create({
+        task_id: task.id,
+        seq: step.seq + 1,
+        type: 'NAV',
+        payload: JSON.stringify({ dest: emptyChargeStation.id }),
+        status: 'PENDING'
+      });
+    } else {
+      console.log(`    ▶ ${emptyChargeStation.name}으로 이동: PRE → 충전소 순서로 스텝 추가`);
+      
+      // PRE 스테이션 → 충전 스테이션 순서로 이동
+      await TaskStep.bulkCreate([
+        {
+          task_id: task.id,
+          seq: step.seq + 1,
+          type: 'NAV',
+          payload: JSON.stringify({ dest: chargePreStation.id }),
+          status: 'PENDING'
+        },
+        {
+          task_id: task.id,
+          seq: step.seq + 2,
+          type: 'NAV',
+          payload: JSON.stringify({ dest: emptyChargeStation.id }),
+          status: 'PENDING'
+        }
+      ]);
+    }
+    
+    console.log(`    ▶ 빈 충전소(${emptyChargeStation.name}) 이동 스텝 추가 완료`);
     await step.update({ status: 'DONE' });
     return true;
   }
@@ -1571,6 +1988,18 @@ async function handleRobot(robot_id) {
       lockedTask = t;
       if (t.status === 'PENDING') {
         await t.update({ status: 'RUNNING' }, { transaction: tx });
+        
+        // 태스크 시작 로그 기록 (트랜잭션 외부에서 실행)
+        setImmediate(async () => {
+          try {
+            const robot = await Robot.findByPk(robot_id);
+            if (robot) {
+              await logTaskStarted(t.id, robot.id, robot.name);
+            }
+          } catch (error) {
+            console.error('[TASK_LOG] 태스크 시작 로그 기록 오류:', error.message);
+          }
+        });
       }
     });
     if (!lockedTask) return;
@@ -1580,13 +2009,51 @@ async function handleRobot(robot_id) {
     step = await TaskStep.findOne({ where:{ task_id:task.id, seq:task.current_seq } });
 
     // handle DONE/FAILED/no-step cases...
-    if (!step)              { await task.update({ status:'DONE' }); return; }
-    if (step.status==='FAILED'){ await task.update({ status:'FAILED' }); return; }
+    if (!step)              { 
+      await task.update({ status:'DONE' }); 
+      
+      // 태스크 완료 로그 기록
+      try {
+        const robot = await Robot.findByPk(robot_id);
+        if (robot) {
+          await logTaskCompleted(task.id, robot.id, robot.name, task.createdAt, new Date());
+        }
+      } catch (error) {
+        console.error('[TASK_LOG] 태스크 완료 로그 기록 오류:', error.message);
+      }
+      
+      return; 
+    }
+    if (step.status==='FAILED'){ 
+      await task.update({ status:'FAILED' }); 
+      
+      // 태스크 실패 로그 기록
+      try {
+        const robot = await Robot.findByPk(robot_id);
+        if (robot) {
+          await logTaskFailed(task.id, robot.id, robot.name, step.error_message || '스텝 실패', task.createdAt, new Date());
+        }
+      } catch (error) {
+        console.error('[TASK_LOG] 태스크 실패 로그 기록 오류:', error.message);
+      }
+      
+      return; 
+    }
     if (step.status==='DONE')  { await task.update({ current_seq: task.current_seq+1 }); return; }
     if (step.status==='PENDING'){ await step.update({ status:'RUNNING' }); }
 
     // actually run it
     const robot = await Robot.findByPk(robot_id);
+    
+    // Manual/Auto 모드 체크 - 스텝 상태 변경 전에 확인
+    const isAutoMode = checkRobotAutoMode(robot);
+    if (!isAutoMode) {
+      console.log(`[MANUAL_MODE] ${robot.name}: 수동 모드 상태입니다. 자동 모드로 전환될 때까지 태스크 스텝(PENDING 상태)에서 대기합니다.`);
+      return; // 스텝을 PENDING 상태로 유지하며 다음 tick에서 다시 체크
+    }
+    
+    // 자동 모드일 때만 스텝을 RUNNING으로 변경
+    if (step.status==='PENDING'){ await step.update({ status:'RUNNING' }); }
     
     // 첫 번째 스텝인 경우 같은 지역 태스크 홀드 체크
     if (task.current_seq === 0) {
@@ -1644,6 +2111,14 @@ async function handleRobot(robot_id) {
     if (finished) {
       await sequelize.transaction(async tx => {
         await step.update({ status:'DONE' }, { transaction: tx });
+        
+        // 스텝 완료 로그 기록
+        try {
+          await logStepCompleted(task.id, robot.id, robot.name, step.seq, step.type, stepStartTime, new Date());
+        } catch (error) {
+          console.error('[TASK_LOG] 스텝 완료 로그 기록 오류:', error.message);
+        }
+        
         await task.update(
           { current_seq: task.current_seq + 1 },
           { transaction: tx }

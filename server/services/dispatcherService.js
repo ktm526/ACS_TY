@@ -10,6 +10,7 @@ const net = require('net');
 const axios = require('axios');
 const ModbusRTU = require('modbus-serial');
 const { Op, DataTypes } = require('sequelize');
+const cron = require('node-cron');
 
 const { logConnChange } = require('./connectionLogger');
 const MapDB = require('../models/Map');
@@ -18,6 +19,13 @@ const Log = require('../models/Log');
 const { Task, TaskStep } = require('../models');   // ← models/index.js
 
 const taskExecutor = require('./taskExecutorService');   // tick() 호출용
+const {
+  logButtonPressed,
+  logTaskAssigned,
+  logTaskPaused,
+  logTaskResumed,
+  logTaskCanceled
+} = require('./taskExecutionLogger');
 /* ────────────────────────────── 1. 상수 ───────────────────────────── */
 const RIOS = {
   '192.168.0.5': {                              // B4 ➜ A4
@@ -91,6 +99,8 @@ const amrLastPosition = new Map(); // robotName -> { x, y, timestamp } (마지�
 const amrErrorStartTime = new Map(); // robotName -> timestamp (오류 상태 시작 시간)
 const amrStopStartTime = new Map(); // robotName -> timestamp (is_stop=true 시작 시간)
 const amrLastConnectionStatus = new Map(); // robotName -> boolean (이전 연결 상태)
+const robotRioStates = new Map(); // robotName -> boolean (RIO 레지스터 17번 상태)
+const amrResumeGraceTime = new Map(); // robotName -> timestamp (재개 후 유예시간)
 
 /* ────────────────────────────── 2. 공통 헬퍼 ──────────────────────── */
 const delay = ms => new Promise(r => setTimeout(r, ms));
@@ -354,25 +364,73 @@ const clearRio = async (dev, idx) => {
   } 
 };
 
-// 17번 레지스터에 값을 설정하는 함수
+// 17번 레지스터에 값을 설정하는 함수 (테스트용: 192.168.0.5에만 작성)
 const setRioRegister17 = async (ip, value) => {
   try {
-    const dev = RIOS[ip];
+    // 테스트용: 192.168.0.5에만 작성
+    const targetIP = '192.168.0.5';
+    const dev = RIOS[targetIP];
+    
     if (!dev || !dev.connected) {
-      throw new Error(`RIO ${ip} is not connected`);
+      console.log(`[RIO_REG17] ${targetIP}: RIO가 연결되지 않음 (요청된 IP: ${ip})`);
+      return false;
     }
+    
     await dev.client.writeRegister(7, value ? 1 : 0);
-
-    //await dev.client.writeRegister(15, value ? 1 : 0);
-
-    //await dev.client.writeRegister(17, value ? 1 : 0);
-
-    //await dev.client.writeRegister(16, value ? 1 : 0);
-    console.log(`[RIO_REG17] ${ip}: 레지스터 17번을 ${value ? 1 : 0}으로 설정 완료`);
+    console.log(`[RIO_REG17] ${targetIP}: 레지스터 7번을 ${value ? 1 : 0}으로 설정 완료 (요청된 IP: ${ip})`);
     return true;
   } catch (error) {
-    console.error(`[RIO_REG17] ${ip}: 레지스터 17번 설정 오류 - ${error.message}`);
-    throw error;
+    console.error(`[RIO_REG17] 192.168.0.5: 레지스터 7번 설정 오류 - ${error.message} (요청된 IP: ${ip})`);
+    return false; // throw 대신 false 반환으로 변경
+  }
+};
+
+// 범용 RIO 레지스터 작성 함수 (버퍼 피드백용)
+const setRioRegister = async (ip, registerNumber, value) => {
+  try {
+    const dev = RIOS[ip];
+    
+    if (!dev || !dev.connected) {
+      console.log(`[RIO_REG] ${ip}: RIO가 연결되지 않음 (레지스터 ${registerNumber}번)`);
+      return false;
+    }
+    
+    await dev.client.writeRegister(registerNumber, value ? 1 : 0);
+    console.log(`[RIO_REG] ${ip}: 레지스터 ${registerNumber}번을 ${value ? 1 : 0}으로 설정 완료`);
+    return true;
+  } catch (error) {
+    console.error(`[RIO_REG] ${ip}: 레지스터 ${registerNumber}번 설정 오류 - ${error.message}`);
+    return false;
+  }
+};
+
+// 버퍼 버튼 피드백 함수 (성공/실패에 따른 레지스터 설정)
+const setBufferButtonFeedback = async (region, bufferNumber, success) => {
+  try {
+    // IP 결정: A지역은 192.168.0.6, B지역은 192.168.0.5
+    const targetIP = region === 'A' ? '192.168.0.6' : '192.168.0.5';
+    
+    // 레지스터 번호 결정
+    let registerNumber;
+    if (bufferNumber === 1) {
+      registerNumber = success ? 10 : 11; // 성공: 10, 실패: 11
+    } else if (bufferNumber === 2) {
+      registerNumber = success ? 12 : 13; // 성공: 12, 실패: 13
+    } else if (bufferNumber === 3) {
+      registerNumber = success ? 14 : 15; // 성공: 14, 실패: 15
+    } else {
+      console.error(`[BUFFER_FEEDBACK] 잘못된 버퍼 번호: ${bufferNumber}`);
+      return false;
+    }
+    
+    console.log(`[BUFFER_FEEDBACK] ${region}${bufferNumber} 버퍼 버튼 ${success ? '성공' : '실패'} 피드백 - IP: ${targetIP}, 레지스터: ${registerNumber}`);
+    
+    // 레지스터에 1 설정
+    return await setRioRegister(targetIP, registerNumber, true);
+    
+  } catch (error) {
+    console.error(`[BUFFER_FEEDBACK] 오류 발생: ${error.message}`);
+    return false;
   }
 };
 
@@ -461,7 +519,21 @@ async function buildTaskFromRioEdge(route, robot, stations) {
       })),
     },
     { include: [{ model: TaskStep, as: 'steps' }] },
-  );
+  ).then(async (task) => {
+    // 태스크 할당 로그 기록
+    try {
+      await logTaskAssigned(
+        task.id,
+        robot.id,
+        robot.name,
+        route.from,
+        route.to || '목적지'
+      );
+    } catch (error) {
+      console.error('[TASK_LOG] 태스크 할당 로그 기록 오류:', error.message);
+    }
+    return task;
+  });
 }
 
 
@@ -485,11 +557,61 @@ async function checkRobotTaskStatus(robot) {
   return true; // 태스크 생성 가능
 }
 
+// 목적지 중복 체크 헬퍼 함수
+async function checkDestinationConflict(destinationId, excludeRobotId = null) {
+  try {
+    // 현재 PENDING, RUNNING, PAUSED 상태인 모든 태스크들의 스텝 확인
+    const conflictingTasks = await Task.findAll({
+      where: {
+        status: { [Op.in]: ['PENDING', 'RUNNING', 'PAUSED'] },
+        ...(excludeRobotId && { robot_id: { [Op.ne]: excludeRobotId } })
+      },
+      include: [{
+        model: TaskStep,
+        as: 'steps',
+        where: {
+          status: { [Op.in]: ['PENDING', 'RUNNING'] },
+          type: { [Op.in]: ['NAV', 'NAV_PRE'] }
+        },
+        required: true
+      }]
+    });
+
+    // 각 태스크의 스텝들을 확인하여 목적지가 일치하는지 체크
+    for (const task of conflictingTasks) {
+      for (const step of task.steps) {
+        try {
+          const payload = typeof step.payload === 'string' 
+            ? JSON.parse(step.payload) 
+            : step.payload;
+          
+          if (payload.dest && String(payload.dest) === String(destinationId)) {
+            // 충돌하는 태스크 정보 가져오기
+            const robot = await Robot.findByPk(task.robot_id);
+            console.log(`[목적지중복방지] 목적지 ${destinationId}로 향하는 기존 태스크가 있습니다: 로봇 ${robot?.name || 'Unknown'}, 태스크 ID ${task.id}, 스텝 ${step.type}`);
+            return false; // 목적지 충돌 발생
+          }
+        } catch (e) {
+          // payload 파싱 오류 시 무시하고 계속 진행
+          console.warn(`[목적지중복체크] 스텝 ${step.id} payload 파싱 오류: ${e.message}`);
+        }
+      }
+    }
+
+    console.log(`[목적지중복방지] 목적지 ${destinationId}에 대한 충돌 없음`);
+    return true; // 목적지 충돌 없음
+  } catch (error) {
+    console.error(`[목적지중복체크] 오류 발생: ${error.message}`);
+    return false; // 오류 발생 시 안전하게 충돌로 처리
+  }
+}
+
 async function handleRioEdge(ip, idx, route) {
   console.log('function handlerioedge')
   const map = await MapDB.findOne({ where: { is_current: true } });
   if (!map) return;
   const stations = (JSON.parse(map.stations || '{}').stations) || [];
+  const robots = await Robot.findAll(); // robots 변수 정의 추가
   const fromSt = stations.find(s => s.name === route.from); if (!fromSt) return;
   const tgtSt = stations.find(s => s.name === (route.to ?? ''));
   //console.log("values:",map, stations, fromSt, tgtSt)
@@ -531,6 +653,12 @@ async function handleRioEdge(ip, idx, route) {
             // 기존 태스크 상태 확인
             if (!(await checkRobotTaskStatus(robotAtBuffer))) {
               console.log(`[메인신호] 로봇 ${robotAtBuffer.name}에 이미 실행 중인 태스크가 있어 호출을 건너뜁니다.`);
+              continue; // 다음 버퍼 확인
+            }
+            
+            // 목적지 중복 체크
+            if (!(await checkDestinationConflict(fromSt.id, robotAtBuffer.id))) {
+              console.log(`[메인신호] 목적지 ${route.from}에 대한 중복 태스크가 있어 호출을 건너뜁니다.`);
               continue; // 다음 버퍼 확인
             }
             
@@ -597,9 +725,16 @@ async function handleRioEdge(ip, idx, route) {
   if (parseInt(idx) >= 1 && parseInt(idx) <= 3) {
     console.log(`[버퍼신호] 레지스터 ${idx}번 신호 감지: ${route.from}→${route.to}`);
     
+    // 버튼 눌림 로그 기록
+    try {
+      await logButtonPressed('시스템', `버퍼${route.from} 호출`, route.from, route.to);
+    } catch (error) {
+      console.error('[TASK_LOG] 버튼 눌림 로그 기록 오류:', error.message);
+    }
+    
     // 지역 확인
     const region = route.from.charAt(0); // 'A' 또는 'B'
-    const bufferNum = route.from.charAt(1); // '1', '2', '3'
+    const bufferNum = parseInt(route.from.charAt(1)); // 1, 2, 3
     const bufferName = `${region}${bufferNum}`;
     
     // 레지스터 4, 5, 6번(버퍼 상태) 값 확인
@@ -631,91 +766,23 @@ async function handleRioEdge(ip, idx, route) {
       if (bufferStatus[bufferNum]) {
         console.log(`[버퍼신호] 주의: 레지스터 값은 ${bufferName}에 로봇이 있다고 표시하지만, DB에서는 로봇을 찾을 수 없습니다.`);
         
-        // AMR이 없고 레지스터 값이 1인 경우: 충전 스테이션에서 AMR 호출
-        console.log(`[버퍼신호] ${bufferName}에 로봇이 없고 레지스터 값이 1입니다. 충전 스테이션에서 AMR 호출 시도...`);
+        // AMR이 없고 레지스터 값이 1인 경우: 새로운 우선순위 로직 적용
+        console.log(`[버퍼신호] ${bufferName}에 로봇이 없고 레지스터 값이 1입니다. 우선순위에 따른 AMR 호출 시도...`);
         
-        // 충전 스테이션에 있는 로봇 찾기
-        const chargeStations = stations.filter(s => 
-          regionOf(s) === region && 
-          hasClass(s, '충전')
-        );
+        // 우선순위별 AMR 찾기 및 호출
+        const calledRobot = await callAmrToBufferWithPriority(region, bufferNum, bufferName, fromSt, stations, robots);
         
-        if (chargeStations.length === 0) {
-          console.log(`[버퍼신호] ${region} 지역에 충전 스테이션이 없습니다. 입력을 무시합니다.`);
-          return;
+        if (calledRobot) {
+          console.log(`[버퍼신호] AMR 호출 성공: ${calledRobot.robot.name} (${calledRobot.source} → ${bufferName})`);
+          // 성공 피드백 전송
+          await setBufferButtonFeedback(region, bufferNum, true);
+        } else {
+          console.log(`[버퍼신호] 호출 가능한 AMR이 없습니다.`);
+          // 실패 피드백 전송
+          await setBufferButtonFeedback(region, bufferNum, false);
         }
         
-        // 충전 스테이션에 있는 로봇들 확인
-        const robots = await Robot.findAll();
-        const robotsAtChargeStations = [];
-        
-        for (const chargeSt of chargeStations) {
-          const robot = robots.find(r => String(r.location) === String(chargeSt.id));
-          if (robot) {
-            const batteryLevel = robot.battery || 0;
-            console.log(`[버퍼신호] 충전 스테이션 ${chargeSt.name}의 로봇 ${robot.name}: 배터리 ${batteryLevel}%`);
-            robotsAtChargeStations.push({ robot, batteryLevel, chargeStation: chargeSt });
-          }
-        }
-        
-        if (robotsAtChargeStations.length === 0) {
-          console.log(`[버퍼신호] ${region} 지역 충전 스테이션에 로봇이 없습니다. 입력을 무시합니다.`);
-          return;
-        }
-        
-        // 배터리가 가장 높은 로봇 선택
-        const bestRobot = robotsAtChargeStations.reduce((highest, current) => {
-          return current.batteryLevel > highest.batteryLevel ? current : highest;
-        });
-        
-        // 배터리가 40% 이하면 호출하지 않음
-        if (bestRobot.batteryLevel <= 40) {
-          console.log(`[버퍼신호] 가장 높은 배터리 로봇(${bestRobot.robot.name})의 배터리가 ${bestRobot.batteryLevel}%로 40% 이하입니다. 호출하지 않습니다.`);
-          return;
-        }
-        
-        console.log(`[버퍼신호] 선택된 로봇: ${bestRobot.robot.name} (배터리: ${bestRobot.batteryLevel}%)`);
-        
-        // 기존 태스크 상태 확인
-        if (!(await checkRobotTaskStatus(bestRobot.robot))) {
-          console.log(`[버퍼신호] 로봇 ${bestRobot.robot.name}에 이미 실행 중인 태스크가 있어 호출을 건너뜁니다.`);
-          return;
-        }
-        
-        // 버퍼 PRE 스테이션 찾기
-        const bufferPreSt = stations.find(s => s.name === `${bufferName}_PRE`);
-        
-        if (!bufferPreSt) {
-          console.error(`[버퍼신호] ${bufferName}_PRE 스테이션을 찾을 수 없습니다.`);
-          return;
-        }
-        
-        // 태스크 생성 (충전소 → 버퍼_PRE → 버퍼)
-        const task = await Task.create(
-          {
-            robot_id: bestRobot.robot.id,
-            steps: [
-              {
-                seq: 0,
-                type: 'NAV',
-                payload: JSON.stringify({ dest: bufferPreSt.id }),
-                status: 'PENDING',
-              },
-              {
-                seq: 1,
-                type: 'NAV',
-                payload: JSON.stringify({ dest: fromSt.id }),
-                status: 'PENDING',
-              }
-            ],
-          },
-          { include: [{ model: TaskStep, as: 'steps' }] },
-        );
-        
-        console.log(`[버퍼신호] 충전소에서 로봇(${bestRobot.robot.name})을 ${bufferName}으로 호출하는 태스크 생성 완료 (태스크 ID: ${task.id})`);
-        await log('BUTTON_TASK', `충전소 호출: ${bestRobot.robot.name} → ${bufferName}`, { robot_name: bestRobot.robot.name });
-        
-        return; // 충전소에서 로봇을 호출했으므로 여기서 처리 종료
+        return; // 여기서 처리 종료
       }
       
       // 버퍼에 AMR이 없고, 레지스터 값도 0인 경우 (버퍼가 정말 비어있음)
@@ -735,6 +802,16 @@ async function handleRioEdge(ip, idx, route) {
             // 기존 태스크 상태 확인
             if (!(await checkRobotTaskStatus(robotAtMainPoint))) {
               console.log(`[버퍼신호] 로봇 ${robotAtMainPoint.name}에 이미 실행 중인 태스크가 있어 호출을 건너뜁니다.`);
+              // 실패 피드백 전송
+              await setBufferButtonFeedback(region, bufferNum, false);
+              return;
+            }
+            
+            // 목적지 중복 체크
+            if (!(await checkDestinationConflict(fromSt.id, robotAtMainPoint.id))) {
+              console.log(`[버퍼신호] 목적지 ${bufferName}에 대한 중복 태스크가 있어 호출을 건너뜁니다.`);
+              // 실패 피드백 전송
+              await setBufferButtonFeedback(region, bufferNum, false);
               return;
             }
             
@@ -743,6 +820,8 @@ async function handleRioEdge(ip, idx, route) {
             
             if (!bufferPreSt) {
               console.error(`[버퍼신호] ${bufferName}_PRE 스테이션을 찾을 수 없습니다.`);
+              // 실패 피드백 전송
+              await setBufferButtonFeedback(region, bufferNum, false);
             } else {
               // 태스크 생성 (PRE로 이동 → JACK_UP → 버퍼로 이동)
               const task = await Task.create(
@@ -775,6 +854,9 @@ async function handleRioEdge(ip, idx, route) {
               console.log(`[버퍼신호] 로봇(${robotAtMainPoint.name})을 ${bufferName}으로 호출하는 태스크 생성 완료 (태스크 ID: ${task.id})`);
               await log('BUTTON_TASK', `버퍼 호출: ${robotAtMainPoint.name} → ${bufferName}`, { robot_name: robotAtMainPoint.name });
               
+              // 성공 피드백 전송
+              await setBufferButtonFeedback(region, bufferNum, true);
+              
               return; // 메인 위치에서 로봇을 호출했으므로 여기서 처리 종료
             }
           } else {
@@ -782,132 +864,15 @@ async function handleRioEdge(ip, idx, route) {
           }
         }
         
-        // 우선순위 2: 다른 버퍼에 있는 AMR 호출 (화물 이송)
-        console.log(`[버퍼신호] 우선순위 2: 다른 버퍼에서 AMR 호출 시도...`);
-        
-        // 같은 지역의 다른 버퍼들 확인 (A1,A2,A3 또는 B1,B2,B3)
-        const otherBufferNumbers = [1, 2, 3].filter(num => num !== parseInt(bufferNum));
-        let sourceRobot = null;
-        let sourceBufferSt = null;
-        let sourceBufferPreSt = null;
-        
-        for (const otherBufferNum of otherBufferNumbers) {
-          const otherBufferName = `${region}${otherBufferNum}`;
-          const otherBufferSt = stations.find(s => s.name === otherBufferName);
-          
-          if (!otherBufferSt) {
-            console.log(`[버퍼신호] ${otherBufferName} 스테이션을 찾을 수 없습니다.`);
-            continue;
-          }
-          
-          // 해당 버퍼에 로봇이 있는지 확인
-          const robotAtOtherBuffer = await Robot.findOne({ where: { location: otherBufferSt.id } });
-          
-          if (robotAtOtherBuffer) {
-            console.log(`[버퍼신호] ${otherBufferName}에서 로봇(${robotAtOtherBuffer.name})을 찾았습니다.`);
-            
-            // 기존 태스크 상태 확인
-            if (!(await checkRobotTaskStatus(robotAtOtherBuffer))) {
-              console.log(`[버퍼신호] 로봇 ${robotAtOtherBuffer.name}에 이미 실행 중인 태스크가 있어 다음 버퍼를 확인합니다.`);
-              continue;
-            }
-            
-            // 소스 버퍼의 PRE 스테이션 찾기
-            const otherBufferPreSt = stations.find(s => s.name === `${otherBufferName}_PRE`);
-            
-            if (!otherBufferPreSt) {
-              console.error(`[버퍼신호] ${otherBufferName}_PRE 스테이션을 찾을 수 없습니다.`);
-              continue;
-            }
-            
-            sourceRobot = robotAtOtherBuffer;
-            sourceBufferSt = otherBufferSt;
-            sourceBufferPreSt = otherBufferPreSt;
-            break; // 첫 번째로 찾은 로봇 사용
-          } else {
-            console.log(`[버퍼신호] ${otherBufferName}에 로봇이 없습니다.`);
-          }
-        }
-        
-        if (sourceRobot && sourceBufferSt && sourceBufferPreSt) {
-          console.log(`[버퍼신호] 우선순위 2: ${sourceBufferSt.name}에서 로봇(${sourceRobot.name})을 ${bufferName}으로 이송합니다.`);
-          
-          // 목적지 버퍼 PRE 스테이션 찾기
-          const targetBufferPreSt = stations.find(s => s.name === `${bufferName}_PRE`);
-          
-          if (!targetBufferPreSt) {
-            console.error(`[버퍼신호] ${bufferName}_PRE 스테이션을 찾을 수 없습니다.`);
-          } else {
-            // 태스크 생성 (JACK_UP → 소스 PRE → JACK_DOWN → 목적지 PRE → JACK_UP → 목적지 버퍼)
-            const task = await Task.create(
-              {
-                robot_id: sourceRobot.id,
-                steps: [
-                  {
-                    seq: 0,
-                    type: 'JACK_UP',
-                    payload: JSON.stringify({ height: 0.03 }),
-                    status: 'PENDING',
-                  },
-                  {
-                    seq: 1,
-                    type: 'NAV_PRE',
-                    payload: JSON.stringify({ dest: sourceBufferPreSt.id }),
-                    status: 'PENDING',
-                  },
-                  {
-                    seq: 2,
-                    type: 'JACK_DOWN',
-                    payload: JSON.stringify({ height: 0.0 }),
-                    status: 'PENDING',
-                  },
-                  {
-                    seq: 3,
-                    type: 'NAV',
-                    payload: JSON.stringify({ dest: targetBufferPreSt.id }),
-                    status: 'PENDING',
-                  },
-                  {
-                    seq: 4,
-                    type: 'JACK_UP',
-                    payload: JSON.stringify({ height: 0.03 }),
-                    status: 'PENDING',
-                  },
-                  {
-                    seq: 5,
-                    type: 'NAV',
-                    payload: JSON.stringify({ dest: fromSt.id }),
-                    status: 'PENDING',
-                  },
-                ],
-              },
-              { include: [{ model: TaskStep, as: 'steps' }] },
-            );
-            
-            console.log(`[버퍼신호] 로봇(${sourceRobot.name})을 ${sourceBufferSt.name}에서 ${bufferName}으로 이송하는 태스크 생성 완료 (태스크 ID: ${task.id})`);
-            await log('BUTTON_TASK', `버퍼 이송: ${sourceRobot.name} ${sourceBufferSt.name} → ${bufferName}`, { robot_name: sourceRobot.name });
-            
-            return; // 다른 버퍼에서 로봇을 호출했으므로 여기서 처리 종료
-          }
-        } else {
-          console.log(`[버퍼신호] 우선순위 2: 다른 버퍼에도 호출할 수 있는 로봇이 없습니다.`);
-        }
-        
-        // 우선순위 3: 모든 버퍼가 비어있으면 입력 무시
-        console.log(`[버퍼신호] 우선순위 3: ${region} 지역에 호출할 수 있는 AMR이 없습니다. 입력을 무시합니다.`);
+        // 메인 위치에 로봇이 없으면 입력 무시
+        console.log(`[버퍼신호] ${region} 지역 메인 위치(${mainPoint})에 호출할 수 있는 AMR이 없습니다. 입력을 무시합니다.`);
+        // 실패 피드백 전송
+        await setBufferButtonFeedback(region, bufferNum, false);
         return; // 입력 무시
       }
       
       return; // 여기서 처리 종료
     }
-    
-    // 레지스터 값과 DB 상태가 불일치하는지 확인 (주의 로그만 출력)
-    if (!bufferStatus[bufferNum]) {
-      console.log(`[버퍼신호] 주의: 레지스터 값은 ${bufferName}이 비어있다고 표시하지만, DB에는 로봇(${robotAtBuffer.name})이 있습니다.`);
-    }
-    
-    // 여기서부터는 기존 로직 계속 진행 (해당 버퍼에 AMR이 있는 경우)
-    console.log(`[버퍼신호] ${bufferName}에 로봇(${robotAtBuffer.name})이 있습니다. 기존 로직으로 처리...`);
   }
 
   // 기존 로직에서는 이미 fromSt를 기준으로 robot을 조회했기 때문에,
@@ -916,14 +881,89 @@ async function handleRioEdge(ip, idx, route) {
   const robot = await Robot.findOne({ where: { location: fromSt.id } });
   if (!robot) {
     console.log("no robot in station")
+    
+    // 버튼 눌림 로그 기록 (무시 사유 포함)
+    try {
+      await logButtonPressed('시스템', `${route.from} 버튼 (무시: 스테이션에 로봇 없음)`, route.from);
+    } catch (error) {
+      console.error('[TASK_LOG] 버튼 눌림 무시 로그 기록 오류:', error.message);
+    }
+    
+    // 버퍼 버튼인 경우 실패 피드백
+    if (parseInt(idx) >= 1 && parseInt(idx) <= 3) {
+      const region = route.from.charAt(0);
+      const bufferNum = parseInt(route.from.charAt(1));
+      await setBufferButtonFeedback(region, bufferNum, false);
+    }
+    
     return
   } else {
     console.log("robot in station")
   }
 
+  // 배터리 체크: 버퍼에 있는 AMR의 배터리가 20% 이하면 무시
+  if (parseInt(idx) >= 1 && parseInt(idx) <= 3) {
+    const batteryLevel = robot.battery || 0;
+    if (batteryLevel <= 30) {
+      console.log(`[배터리부족] ${robot.name}: 배터리 ${batteryLevel}%로 20% 이하입니다. 버튼 입력을 무시합니다.`);
+      
+      // 버튼 눌림 로그 기록 (무시 사유 포함)
+      try {
+        await logButtonPressed(robot.name, `${route.from} 버튼 (무시: 배터리 부족 ${batteryLevel}%)`, route.from);
+      } catch (error) {
+        console.error('[TASK_LOG] 배터리 부족 무시 로그 기록 오류:', error.message);
+      }
+      
+      // 버퍼 버튼인 경우 실패 피드백
+      const region = route.from.charAt(0);
+      const bufferNum = parseInt(route.from.charAt(1));
+      await setBufferButtonFeedback(region, bufferNum, false);
+      
+      return;
+    } else {
+      console.log(`[배터리체크] ${robot.name}: 배터리 ${batteryLevel}% - 충분함`);
+    }
+  }
+
   // 메인 태스크 생성 전 기존 태스크 상태 확인
   if (!(await checkRobotTaskStatus(robot))) {
     console.log(`[태스크중복방지] 로봇 ${robot.name}에 이미 실행 중인 태스크가 있어 새로운 태스크 생성을 건너뜁니다.`);
+    
+    // 버튼 눌림 로그 기록 (무시 사유 포함)
+    try {
+      await logButtonPressed(robot.name, `${route.from} 버튼 (무시: 태스크 실행 중)`, route.from);
+    } catch (error) {
+      console.error('[TASK_LOG] 버튼 눌림 무시 로그 기록 오류:', error.message);
+    }
+    
+    // 버퍼 버튼인 경우 실패 피드백
+    if (parseInt(idx) >= 1 && parseInt(idx) <= 3) {
+      const region = route.from.charAt(0);
+      const bufferNum = parseInt(route.from.charAt(1));
+      await setBufferButtonFeedback(region, bufferNum, false);
+    }
+    
+    return;
+  }
+
+  // 목적지 중복 체크 (route.to가 있는 경우에만)
+  if (tgtSt && !(await checkDestinationConflict(tgtSt.id, robot.id))) {
+    console.log(`[태스크중복방지] 목적지 ${route.to}에 대한 중복 태스크가 있어 새로운 태스크 생성을 건너뜁니다.`);
+    
+    // 버튼 눌림 로그 기록 (무시 사유 포함)
+    try {
+      await logButtonPressed(robot.name, `${route.from} 버튼 (무시: 목적지 중복)`, route.from);
+    } catch (error) {
+      console.error('[TASK_LOG] 버튼 눌림 무시 로그 기록 오류:', error.message);
+    }
+    
+    // 버퍼 버튼인 경우 실패 피드백
+    if (parseInt(idx) >= 1 && parseInt(idx) <= 3) {
+      const region = route.from.charAt(0);
+      const bufferNum = parseInt(route.from.charAt(1));
+      await setBufferButtonFeedback(region, bufferNum, false);
+    }
+    
     return;
   }
 
@@ -939,8 +979,69 @@ async function handleRioEdge(ip, idx, route) {
       (fromIsALine && toIsA4 && occupied)) {
       await log('RIO_IGNORE', `${route.from}→${route.to} (dest occupied)`);
       console.log('toSt Occupied')
+      
+      // 버튼 눌림 로그 기록 (무시 사유 포함)
+      try {
+        await logButtonPressed('시스템', `${route.from} 버튼 (무시: 목적지 점유)`, route.from);
+      } catch (error) {
+        console.error('[TASK_LOG] 버튼 눌림 무시 로그 기록 오류:', error.message);
+      }
+      
+      // 버퍼 버튼인 경우 실패 피드백
+      if (parseInt(idx) >= 1 && parseInt(idx) <= 3) {
+        const region = route.from.charAt(0);
+        const bufferNum = parseInt(route.from.charAt(1));
+        await setBufferButtonFeedback(region, bufferNum, false);
+      }
+      
       return;                      // ★ 태스크 생성 안 함
     }
+  }
+
+  /*  --------  (1.5) A4→B 특별 체크: B 지역 버퍼 상태 확인  ------------ */
+  if (route.from === 'A4' && route.to === 'B4') {
+    console.log(`[A4→B체크] A4에서 B로 이동 시도: B 지역 버퍼 상태 확인`);
+    
+    // B 지역 RIO 장치에서 버퍼 상태 확인 (192.168.0.5)
+    const bRioDevice = RIOS['192.168.0.5'];
+    let allBBuffersOccupied = false;
+    
+    try {
+      if (bRioDevice && bRioDevice.connected && bRioDevice.lastRegs) {
+        // 레지스터 4,5,6은 각각 B1,B2,B3 버퍼 상태를 나타냄 (1=차있음, 0=비어있음)  
+        const buf1Occupied = bRioDevice.lastRegs[4] === 1;
+        const buf2Occupied = bRioDevice.lastRegs[5] === 1;
+        const buf3Occupied = bRioDevice.lastRegs[6] === 1;
+        
+        allBBuffersOccupied = buf1Occupied && buf2Occupied && buf3Occupied;
+        console.log(`[A4→B체크] B 지역 버퍼 상태: B1=${buf1Occupied}, B2=${buf2Occupied}, B3=${buf3Occupied}, 모두차있음=${allBBuffersOccupied}`);
+      } else {
+        console.log(`[A4→B체크] B 지역 RIO(192.168.0.5) 연결 안됨, 안전하게 모두 차있다고 간주`);
+        // RIO 연결 안 되면 안전하게 버퍼가 모두 차있다고 간주
+        allBBuffersOccupied = true;
+      }
+    } catch (err) {
+      console.error(`[A4→B체크] B 지역 RIO 상태 확인 오류: ${err.message}`);
+      // 오류 발생 시 안전하게 버퍼가 모두 차있다고 간주
+      allBBuffersOccupied = true;
+    }
+    
+    // B 지역 버퍼가 모두 차있으면 A4→B 이동 무시
+    if (allBBuffersOccupied) {
+      console.log(`[A4→B체크] A4→B 이동 무시: B 지역 버퍼(B1,B2,B3)가 모두 차있음`);
+      await log('RIO_IGNORE', `A4→B (B 지역 버퍼 모두 차있음)`);
+      
+      // 버튼 눌림 로그 기록 (무시 사유 포함)
+      try {
+        await logButtonPressed('시스템', `A4 버튼 (무시: B 지역 버퍼 모두 차있음)`, route.from);
+      } catch (error) {
+        console.error('[TASK_LOG] A4→B 무시 로그 기록 오류:', error.message);
+      }
+      
+      return;  // 태스크 생성 안 함
+    }
+    
+    console.log(`[A4→B체크] A4→B 이동 허용: B 지역에 빈 버퍼 있음`);
   }
 
   /*  --------  (2) 교차점 및 버퍼 상태 체크  ------------ */
@@ -987,6 +1088,21 @@ async function handleRioEdge(ip, idx, route) {
     if (allBuffersOccupied && crossPointOccupied) {
       console.log(`${route.from}→${crossPoint} 이동 불가: 버퍼 모두 차있고 ${crossPoint}에 로봇 있음`);
       await log('RIO_IGNORE', `${route.from}→${targetRegion} (버퍼 모두 차있고 ${crossPoint} 점유됨)`);
+      
+      // 버튼 눌림 로그 기록 (무시 사유 포함)
+      try {
+        await logButtonPressed('시스템', `${route.from} 버튼 (무시: 버퍼 만점 및 교차점 점유)`, route.from);
+      } catch (error) {
+        console.error('[TASK_LOG] 버튼 눌림 무시 로그 기록 오류:', error.message);
+      }
+      
+      // 버퍼 버튼인 경우 실패 피드백
+      if (parseInt(idx) >= 1 && parseInt(idx) <= 3) {
+        const region = route.from.charAt(0);
+        const bufferNum = parseInt(route.from.charAt(1));
+        await setBufferButtonFeedback(region, bufferNum, false);
+      }
+      
       return;  // 태스크 생성 안 함
     }
   }
@@ -996,6 +1112,23 @@ async function handleRioEdge(ip, idx, route) {
   if (task) {
     console.log("task_create", `RIO ${ip} reg${idx} -> task#${task.id}`)
     await log('TASK_CREATE', `RIO ${ip} reg${idx} -> task#${task.id}`, { robot_name: robot.name });
+    
+    // 버퍼 버튼인 경우 성공 피드백
+    if (parseInt(idx) >= 1 && parseInt(idx) <= 3) {
+      const region = route.from.charAt(0);
+      const bufferNum = parseInt(route.from.charAt(1));
+      await setBufferButtonFeedback(region, bufferNum, true);
+    }
+  } else {
+    // 태스크 생성 실패인 경우
+    console.log("task creation failed")
+    
+    // 버퍼 버튼인 경우 실패 피드백
+    if (parseInt(idx) >= 1 && parseInt(idx) <= 3) {
+      const region = route.from.charAt(0);
+      const bufferNum = parseInt(route.from.charAt(1));
+      await setBufferButtonFeedback(region, bufferNum, false);
+    }
   }
 }
 
@@ -1199,6 +1332,22 @@ async function workerTick() {
               console.log(`[POSITION_RESET] ${robot.name}: 위치 변화 감지로 일시정지 타이머 리셋`);
               amrStopStartTime.delete(robot.name);
             }
+            
+            // 위치 변화가 감지되면 RIO 신호도 0으로 리셋
+            const currentRioState = robotRioStates.get(robot.name);
+            if (currentRioState === true) {
+              console.log(`[POSITION_RESET] ${robot.name}: 위치 변화 감지로 RIO 신호 0으로 리셋`);
+              try {
+                const allRioIPs = ['192.168.0.5', '192.168.0.6'];
+                for (const rioIP of allRioIPs) {
+                  await setRioRegister17(rioIP, false);
+                  console.log(`[POSITION_RESET] ${robot.name}: RIO 레지스터 17번을 0으로 설정 완료 (${rioIP})`);
+                }
+                robotRioStates.set(robot.name, false);
+              } catch (error) {
+                console.error(`[POSITION_RESET] ${robot.name}: RIO 레지스터 설정 오류 - ${error.message}`);
+              }
+            }
           } else {
             // 위치 변화가 없는 경우, NAV 스텝이면서 이동 상태일 때만 타이머 시작
             // 실행 중인 태스크와 스텝 확인
@@ -1240,10 +1389,16 @@ async function workerTick() {
           // 오류 상태 추적
           if (robot.status === '오류') {
             if (!amrErrorStartTime.has(robot.name)) {
+              // 새로 오류 상태가 된 경우
               amrErrorStartTime.set(robot.name, now);
+              console.log(`[ERROR_DETECTED] ${robot.name}: 오류 상태 감지됨`);
             }
           } else {
-            amrErrorStartTime.delete(robot.name);
+            // 오류 상태가 아닌 경우
+            if (amrErrorStartTime.has(robot.name)) {
+              console.log(`[ERROR_RECOVERED] ${robot.name}: 오류 상태 복구됨`);
+              amrErrorStartTime.delete(robot.name);
+            }
           }
           
           // DI 센서 정보 처리
@@ -1289,10 +1444,16 @@ async function workerTick() {
           // 태스크 일시정지 조건 확인
           await checkTaskPauseConditions(robot, now);
           
+          // 위치 변화와 RIO 신호 처리 (태스크 일시정지 없음)
+          await checkPositionAndRioSignal(robot, now);
+          
         } catch (e) {
           // DI 정보 파싱 오류 시 무시 (너무 많은 로그 방지)
         }
       }
+      
+      // 자동 충전 로직: B동 버퍼에 있는 배터리 30% 이하 AMR을 충전소로 이동
+      await checkAndSendLowBatteryRobotsToChargeStation(map, stations, robots);
     }
 
     // Task 실행기
@@ -1326,6 +1487,13 @@ exports.manualDispatch = async (req, res) => {
       });
     }
 
+    // 목적지 중복 체크
+    if (!(await checkDestinationConflict(dest, robot.id))) {
+      return res.status(409).json({ 
+        msg: `목적지 ${dest}에 대한 중복 태스크가 있습니다.` 
+      });
+    }
+
     const task = await Task.create(
       {
         robot_id: robot.id,
@@ -1340,6 +1508,14 @@ exports.manualDispatch = async (req, res) => {
     );
 
     await Log.create({ type: 'TASK_MANUAL', message: `${robotName}→${dest}`, robot_name: robotName });
+    
+    // TaskExecutionLog에 수동 태스크 할당 기록
+    try {
+      await logTaskAssigned(task.id, robot.id, robot.name, '현재위치', String(dest));
+    } catch (error) {
+      console.error('[TASK_LOG] 수동 태스크 할당 로그 기록 오류:', error.message);
+    }
+    
     res.json({ task_id: task.id });
   } catch (e) {
     console.error(e);
@@ -1402,6 +1578,13 @@ async function handleCancelSignal(robot) {
       console.log(`[CANCEL_HANDLER] ${robot.name}: 태스크 취소 완료`);
       await log('TASK_CANCEL', `${robot.name}: 사용자 취소 신호`, { robot_name: robot.name });
       
+      // 태스크 취소 로그 기록
+      try {
+        await logTaskCanceled(runningTask.id, robot.id, robot.name, '사용자 취소 신호');
+      } catch (error) {
+        console.error('[TASK_LOG] 태스크 취소 로그 기록 오류:', error.message);
+      }
+      
       // RIO 레지스터 17번을 0으로 설정 (취소 신호)
       try {
         // 모든 RIO IP에 대해 레지스터 17번 설정
@@ -1461,6 +1644,18 @@ async function handleRestartSignal(robot) {
       if (runningTask.status === 'PAUSED') {
         await runningTask.update({ status: 'RUNNING' });
         console.log(`[RESTART_HANDLER] ${robot.name}: 태스크 상태를 PAUSED → RUNNING으로 변경`);
+        
+        // 재개 후 유예시간 설정 (오류 상태 재체크 방지)
+        const now = Date.now();
+        amrResumeGraceTime.set(robot.name, now);
+        console.log(`[RESTART_HANDLER] ${robot.name}: 재개 후 30초 유예시간 설정`);
+        
+        // 태스크 재개 로그 기록
+        try {
+          await logTaskResumed(runningTask.id, robot.id, robot.name, '사용자 재시작 신호');
+        } catch (error) {
+          console.error('[TASK_LOG] 태스크 재개 로그 기록 오류:', error.message);
+        }
         
         // RIO 레지스터 17번을 0으로 설정 (재개 신호)
         try {
@@ -1529,10 +1724,11 @@ async function resendCurrentStepCommand(robot, step) {
   }
 }
 
-// 태스크 일시정지 조건 확인 함수
+// 태스크 일시정지 조건 확인 함수 (위치 변화 없음 조건 제거)
 async function checkTaskPauseConditions(robot, now) {
   try {
-    const TIMEOUT_MS = 60 * 1000; // 1분
+    const TIMEOUT_MS = 60 * 1000; // 1분 (네트워크 연결 끊김용)
+    const GRACE_PERIOD_MS = 30 * 1000; // 30초 (재개 후 유예시간)
     
     // 현재 실행 중인 태스크 확인
     const runningTask = await Task.findOne({
@@ -1555,28 +1751,26 @@ async function checkTaskPauseConditions(robot, now) {
     
     // 1. 네트워크 연결 끊김 체크 (1분 이상)
     const lastNetworkTime = amrLastNetworkTime.get(robot.name);
-    if (robot.status === '연결 안됨' || (lastNetworkTime && now - lastNetworkTime > TIMEOUT_MS)) {
+    if (lastNetworkTime && now - lastNetworkTime > TIMEOUT_MS) {
       shouldPause = true;
       reason = '네트워크 연결 끊김 (1분 이상)';
     }
     
-    // 2. 오류 상태 체크 (1분 이상)
+    // 2. 오류 상태 체크 (바로 일시정지, 단 재개 후 유예시간 고려)
     const errorStartTime = amrErrorStartTime.get(robot.name);
-    if (errorStartTime && now - errorStartTime > TIMEOUT_MS) {
-      shouldPause = true;
-      reason = '오류 상태 지속 (1분 이상)';
-    }
+    const resumeGraceTime = amrResumeGraceTime.get(robot.name);
     
-    // 3. NAV 스텝 중 위치 변화 없음 체크 (1분 이상) - workerTick에서 관리되는 타이머 확인
-    if (runningTask.steps && runningTask.steps.length > 0) {
-      const currentStep = runningTask.steps[0];
-      if ((currentStep.type === 'NAV' || currentStep.type === 'NAV_PRE') && robot.status === '이동') {
-        const stopStartTime = amrStopStartTime.get(robot.name);
-        if (stopStartTime && now - stopStartTime > TIMEOUT_MS) {
-          shouldPause = true;
-          reason = 'NAV 중 위치 변화 없음 (1분 이상)';
-          console.log(`[PAUSE_CHECK] ${robot.name}: NAV 중 위치 변화 없음 지속 감지 - 시작 시간: ${new Date(stopStartTime).toLocaleTimeString()}, 지속 시간: ${Math.round((now - stopStartTime) / 1000)}초, 현재 스텝: ${currentStep.type}`);
-        }
+    if (errorStartTime) {
+      // 재개 후 유예시간 내인지 확인
+      const inGracePeriod = resumeGraceTime && (now - resumeGraceTime) < GRACE_PERIOD_MS;
+      
+      if (!inGracePeriod) {
+        // 유예시간이 없거나 유예시간이 지났으면 바로 일시정지
+        shouldPause = true;
+        reason = 'AMR 오류 상태 감지';
+        console.log(`[ERROR_PAUSE] ${robot.name}: 오류 상태로 인한 즉시 일시정지 (유예시간: ${inGracePeriod ? '적용중' : '없음'})`);
+      } else {
+        console.log(`[ERROR_GRACE] ${robot.name}: 오류 상태이지만 재개 후 유예시간 중 (${Math.round((GRACE_PERIOD_MS - (now - resumeGraceTime)) / 1000)}초 남음)`);
       }
     }
     
@@ -1585,6 +1779,28 @@ async function checkTaskPauseConditions(robot, now) {
       console.log(`[TASK_PAUSE] ${robot.name}: ${reason} - 태스크 일시정지`);
       await runningTask.update({ status: 'PAUSED' });
       await log('TASK_PAUSE', `${robot.name}: ${reason}`, { robot_name: robot.name });
+      
+      // 유예시간 초기화 (일시정지되었으므로)
+      if (amrResumeGraceTime.has(robot.name)) {
+        amrResumeGraceTime.delete(robot.name);
+        console.log(`[GRACE_CLEAR] ${robot.name}: 일시정지로 인한 유예시간 초기화`);
+      }
+      
+      // 태스크 일시정지 로그 기록
+      try {
+        await logTaskPaused(runningTask.id, robot.id, robot.name, reason);
+      } catch (error) {
+        console.error('[TASK_LOG] 태스크 일시정지 로그 기록 오류:', error.message);
+      }
+      
+      // 🚨 알람 울림 - 매우 눈에 띄는 경고 메시지
+      console.log('\n' + '🚨'.repeat(50));
+      console.log('🚨🚨🚨 【 AMR 알람 발생 】 🚨🚨🚨');
+      console.log(`🚨 로봇명: ${robot.name}`);
+      console.log(`🚨 사유: ${reason}`);
+      console.log(`🚨 시간: ${new Date().toLocaleString()}`);
+      console.log(`🚨 상태: 태스크 일시정지로 인한 알람 활성화`);
+      console.log('🚨'.repeat(50) + '\n');
       
       // RIO 레지스터 17번을 1로 설정 (일시정지 신호)
       try {
@@ -1604,6 +1820,120 @@ async function checkTaskPauseConditions(robot, now) {
   }
 }
 
+// 위치 변화와 RIO 신호 처리 함수 (태스크는 일시정지하지 않음)
+async function checkPositionAndRioSignal(robot, now) {
+  try {
+    const TIMEOUT_MS = 60 * 1000; // 1분
+    
+    // 현재 실행 중인 태스크 확인
+    const runningTask = await Task.findOne({
+      where: {
+        robot_id: robot.id,
+        status: 'RUNNING'
+      },
+      include: [{
+        model: TaskStep,
+        as: 'steps',
+        where: { status: 'RUNNING' },
+        required: false
+      }]
+    });
+    
+    if (!runningTask) {
+      // 실행 중인 태스크가 없으면 RIO 신호를 0으로 리셋
+      const currentRioState = robotRioStates.get(robot.name);
+      if (currentRioState === true) {
+        try {
+          const allRioIPs = ['192.168.0.5', '192.168.0.6'];
+          for (const rioIP of allRioIPs) {
+            await setRioRegister17(rioIP, false);
+            console.log(`[RIO_RESET] ${robot.name}: 태스크 없음으로 RIO 레지스터 17번을 0으로 설정 (${rioIP})`);
+          }
+          robotRioStates.set(robot.name, false);
+        } catch (error) {
+          console.error(`[RIO_RESET] ${robot.name}: RIO 레지스터 설정 오류 - ${error.message}`);
+        }
+      }
+      return;
+    }
+    
+    // NAV 스텝 중 위치 변화 없음 체크 (1분 이상)
+    if (runningTask.steps && runningTask.steps.length > 0) {
+      const currentStep = runningTask.steps[0];
+      if ((currentStep.type === 'NAV' || currentStep.type === 'NAV_PRE') && robot.status === '이동') {
+        const stopStartTime = amrStopStartTime.get(robot.name);
+        const currentRioState = robotRioStates.get(robot.name);
+        
+        if (stopStartTime && now - stopStartTime > TIMEOUT_MS) {
+          // 위치 변화 없음이 1분 이상 지속됨 - RIO 신호만 1로 설정
+          if (currentRioState !== true) {
+            console.log(`[RIO_SIGNAL] ${robot.name}: NAV 중 위치 변화 없음 (1분 이상) - RIO 신호 1로 설정`);
+            console.log(`[RIO_SIGNAL] ${robot.name}: 시작 시간: ${new Date(stopStartTime).toLocaleTimeString()}, 지속 시간: ${Math.round((now - stopStartTime) / 1000)}초, 현재 스텝: ${currentStep.type}`);
+            
+            // 🚨 알람 울림 - 매우 눈에 띄는 경고 메시지
+            console.log('\n' + '⚠️'.repeat(50));
+            console.log('⚠️⚠️⚠️ 【 AMR 위치 변화 없음 알람 】 ⚠️⚠️⚠️');
+            console.log(`⚠️ 로봇명: ${robot.name}`);
+            console.log(`⚠️ 사유: NAV 중 위치 변화 없음 (1분 이상 지속)`);
+            console.log(`⚠️ 시작시간: ${new Date(stopStartTime).toLocaleString()}`);
+            console.log(`⚠️ 지속시간: ${Math.round((now - stopStartTime) / 1000)}초`);
+            console.log(`⚠️ 현재스텝: ${currentStep.type}`);
+            console.log(`⚠️ 시간: ${new Date().toLocaleString()}`);
+            console.log('⚠️'.repeat(50) + '\n');
+            
+            try {
+              const allRioIPs = ['192.168.0.5', '192.168.0.6'];
+              for (const rioIP of allRioIPs) {
+                await setRioRegister17(rioIP, true);
+                console.log(`[RIO_SIGNAL] ${robot.name}: RIO 레지스터 17번을 1로 설정 완료 (${rioIP})`);
+              }
+              robotRioStates.set(robot.name, true);
+            } catch (error) {
+              console.error(`[RIO_SIGNAL] ${robot.name}: RIO 레지스터 설정 오류 - ${error.message}`);
+            }
+          }
+        } else {
+          // 위치 변화 없음이 1분 미만이거나 타이머가 없음 - RIO 신호를 0으로 유지
+          if (currentRioState === true) {
+            console.log(`[RIO_SIGNAL] ${robot.name}: NAV 중이지만 위치 변화 없음 시간이 1분 미만 - RIO 신호 0으로 리셋`);
+            
+            try {
+              const allRioIPs = ['192.168.0.5', '192.168.0.6'];
+              for (const rioIP of allRioIPs) {
+                await setRioRegister17(rioIP, false);
+                console.log(`[RIO_SIGNAL] ${robot.name}: RIO 레지스터 17번을 0으로 설정 완료 (${rioIP})`);
+              }
+              robotRioStates.set(robot.name, false);
+            } catch (error) {
+              console.error(`[RIO_SIGNAL] ${robot.name}: RIO 레지스터 설정 오류 - ${error.message}`);
+            }
+          }
+        }
+      } else {
+        // NAV 스텝이 아니거나 이동 상태가 아님 - RIO 신호를 0으로 리셋
+        const currentRioState = robotRioStates.get(robot.name);
+        if (currentRioState === true) {
+          console.log(`[RIO_SIGNAL] ${robot.name}: NAV 스텝 아님 또는 이동 상태 아님 - RIO 신호 0으로 리셋`);
+          
+          try {
+            const allRioIPs = ['192.168.0.5', '192.168.0.6'];
+            for (const rioIP of allRioIPs) {
+              await setRioRegister17(rioIP, false);
+              console.log(`[RIO_SIGNAL] ${robot.name}: RIO 레지스터 17번을 0으로 설정 완료 (${rioIP})`);
+            }
+            robotRioStates.set(robot.name, false);
+          } catch (error) {
+            console.error(`[RIO_SIGNAL] ${robot.name}: RIO 레지스터 설정 오류 - ${error.message}`);
+          }
+        }
+      }
+    }
+    
+  } catch (error) {
+    console.error(`[RIO_SIGNAL_CHECK] ${robot.name}: 오류 발생 - ${error.message}`);
+  }
+}
+
 /* ─────────────── 10. export (테스트용) ─────────────────────────── */
 exports.workerTick = workerTick;
 exports.pollAllRios = pollAllRios;
@@ -1614,6 +1944,7 @@ exports.amrLastPosition = amrLastPosition;
 exports.amrErrorStartTime = amrErrorStartTime;
 exports.amrStopStartTime = amrStopStartTime;
 exports.amrLastConnectionStatus = amrLastConnectionStatus;
+exports.amrResumeGraceTime = amrResumeGraceTime;
 exports.RIOS = RIOS;
 exports.doorState = doorState;
 exports.ALARM_STATE = ALARM_STATE;
@@ -1658,77 +1989,221 @@ async function callAmrToBuffer(region, bufferNum) {
       return;
     }
     
-    // 충전 스테이션에 있는 로봇들 중 배터리 40% 이상인 로봇들만 필터링
-    const eligibleRobots = [];
+    // 충전 스테이션에 있는 로봇들 중 새로운 조건에 따라 선택
+    const robotsAtChargeStations = [];
     
     for (const chargeSt of chargeStations) {
       const robot = robots.find(r => String(r.location) === String(chargeSt.id));
       if (robot) {
         const batteryLevel = robot.battery || 0;
         console.log(`[버퍼버튼] 충전 스테이션 ${chargeSt.name}의 로봇 ${robot.name}: 배터리 ${batteryLevel}%`);
-        
-        if (batteryLevel >= 40) {
-          eligibleRobots.push(robot);
-        } else {
-          console.log(`[버퍼버튼] 로봇 ${robot.name}의 배터리(${batteryLevel}%)가 40% 미만이므로 제외`);
-        }
+        robotsAtChargeStations.push({ robot, batteryLevel, chargeStation: chargeSt });
       }
     }
     
-    if (eligibleRobots.length === 0) {
-      console.log(`[버퍼버튼] ${region} 지역 충전 스테이션에 배터리 40% 이상인 로봇이 없습니다.`);
-      return;
-    }
-    
-    // 배터리가 가장 높은 로봇 선택
-    const amrAtCharger = eligibleRobots.reduce((highest, current) => {
-      return (current.battery || 0) > (highest.battery || 0) ? current : highest;
-    });
-    
-    const batteryLevel = amrAtCharger.battery || 0;
-    console.log(`[버퍼버튼] 선택된 로봇: ${amrAtCharger.name} (배터리: ${batteryLevel}%)`);
-    console.log(`[버퍼버튼] ${bufferName}로 로봇(${amrAtCharger.name}, 배터리:${batteryLevel}%) 호출 시작`);
-    
-    // 기존 태스크 상태 확인
-    if (!(await checkRobotTaskStatus(amrAtCharger))) {
-      console.log(`[버퍼버튼] 로봇 ${amrAtCharger.name}에 이미 실행 중인 태스크가 있어 호출을 건너뜁니다.`);
-      return;
-    }
-    
-    // 5. 버퍼 PRE 스테이션 찾기
-    const bufferPreSt = stations.find(s => s.name === `${bufferName}_PRE`);
-    
-    if (!bufferPreSt) {
-      console.error(`[버퍼버튼] ${bufferName}_PRE 스테이션을 찾을 수 없습니다.`);
-      return;
-    }
-    
-    // 6. 테스크 생성 (버퍼_PRE로 이동 -> 버퍼로 이동)
-    const task = await Task.create(
-      {
-        robot_id: amrAtCharger.id,
-        steps: [
-          {
-            seq: 0,
-            type: 'NAV',
-            payload: JSON.stringify({ dest: bufferPreSt.id }),
-            status: 'PENDING',
-          },
-          {
-            seq: 1,
-            type: 'NAV',
-            payload: JSON.stringify({ dest: bufferSt.id }),
-            status: 'PENDING',
+    if (robotsAtChargeStations.length === 0) {
+      console.log(`[버퍼버튼] ${region} 지역 충전 스테이션에 로봇이 없습니다.`);
+      
+      // 같은 지역의 다른 버퍼에서 AMR 찾기
+      console.log(`[버퍼버튼] 같은 지역의 다른 버퍼에서 AMR 호출 시도...`);
+      
+      // 같은 지역의 다른 버퍼 스테이션들 찾기 (현재 요청된 버퍼 제외)
+      const otherBufferStations = stations.filter(s => 
+        regionOf(s) === region && 
+        hasClass(s, '버퍼') && 
+        s.name.match(/^[AB][1-3]$/) && // A1-A3, B1-B3 형태
+        s.name !== bufferName // 현재 요청된 버퍼 제외
+      );
+      
+      console.log(`[버퍼버튼] ${region} 지역 다른 버퍼 스테이션: ${otherBufferStations.map(s => s.name).join(', ')}`);
+      
+      // 다른 버퍼에서 AMR 찾기
+      let selectedBufferRobot = null;
+      let sourceBufferStation = null;
+      
+      for (const bufferSt of otherBufferStations) {
+        const robotAtOtherBuffer = robots.find(r => String(r.location) === String(bufferSt.id));
+        
+        if (robotAtOtherBuffer) {
+          console.log(`[버퍼버튼] ${bufferSt.name}에서 로봇 ${robotAtOtherBuffer.name} 발견`);
+          
+          // 기존 태스크 상태 확인
+          const hasTask = await checkRobotTaskStatus(robotAtOtherBuffer);
+          
+          if (hasTask) {
+            selectedBufferRobot = robotAtOtherBuffer;
+            sourceBufferStation = bufferSt;
+            console.log(`[버퍼버튼] ${bufferSt.name}의 로봇 ${robotAtOtherBuffer.name}을 선택했습니다.`);
+            break; // 첫 번째로 찾은 사용 가능한 로봇 선택
+          } else {
+            console.log(`[버퍼버튼] ${bufferSt.name}의 로봇 ${robotAtOtherBuffer.name}에 이미 태스크가 있어 건너뜀`);
           }
-        ],
-      },
-      { include: [{ model: TaskStep, as: 'steps' }] },
-    );
-    
-    console.log(`[버퍼버튼] ${amrAtCharger.name}을(를) ${bufferName}으로 호출하는 태스크 생성 완료 (태스크 ID: ${task.id})`);
-    await log('BUTTON_TASK', `버퍼 이송: ${amrAtCharger.name} → ${bufferName}`, { robot_name: amrAtCharger.name });
-    
-    return task;
+        }
+      }
+      
+      if (!selectedBufferRobot) {
+        console.log(`[버퍼버튼] ${region} 지역 다른 버퍼에도 사용 가능한 AMR이 없습니다.`);
+        return;
+      }
+      
+      // 목적지 중복 체크
+      if (!(await checkDestinationConflict(bufferSt.id, selectedBufferRobot.id))) {
+        console.log(`[버퍼버튼] 목적지 ${bufferName}에 대한 중복 태스크가 있어 호출을 건너뜁니다.`);
+        return;
+      }
+      
+      // 소스 버퍼의 PRE 스테이션과 목적지 버퍼의 PRE 스테이션 찾기
+      const sourceBufferPreSt = stations.find(s => s.name === `${sourceBufferStation.name}_PRE`);
+      const targetBufferPreSt = stations.find(s => s.name === `${bufferName}_PRE`);
+      
+      if (!sourceBufferPreSt) {
+        console.error(`[버퍼버튼] ${sourceBufferStation.name}_PRE 스테이션을 찾을 수 없습니다.`);
+        return;
+      }
+      
+      if (!targetBufferPreSt) {
+        console.error(`[버퍼버튼] ${bufferName}_PRE 스테이션을 찾을 수 없습니다.`);
+        return;
+      }
+      
+      // 태스크 생성 (JACK_DOWN → 소스버퍼_PRE → 목적지버퍼_PRE → 목적지버퍼 → JACK_UP)
+      const task = await Task.create(
+        {
+          robot_id: selectedBufferRobot.id,
+          steps: [
+            {
+              seq: 0,
+              type: 'JACK_DOWN',
+              payload: JSON.stringify({ height: 0.0 }),
+              status: 'PENDING',
+            },
+            {
+              seq: 1,
+              type: 'NAV',
+              payload: JSON.stringify({ dest: sourceBufferPreSt.id }),
+              status: 'PENDING',
+            },
+            {
+              seq: 2,
+              type: 'NAV',
+              payload: JSON.stringify({ dest: targetBufferPreSt.id }),
+              status: 'PENDING',
+            },
+            {
+              seq: 3,
+              type: 'NAV',
+              payload: JSON.stringify({ dest: bufferSt.id }),
+              status: 'PENDING',
+            },
+            {
+              seq: 4,
+              type: 'JACK_UP',
+              payload: JSON.stringify({ height: 0.03 }),
+              status: 'PENDING',
+            }
+          ],
+        },
+        { include: [{ model: TaskStep, as: 'steps' }] },
+      );
+      
+      console.log(`[버퍼버튼] 다른 버퍼에서 로봇(${selectedBufferRobot.name})을 ${sourceBufferStation.name} → ${bufferName}으로 호출하는 태스크 생성 완료 (태스크 ID: ${task.id})`);
+      await log('BUTTON_TASK', `버퍼간 호출: ${selectedBufferRobot.name} ${sourceBufferStation.name} → ${bufferName}`, { robot_name: selectedBufferRobot.name });
+      
+      // 태스크 할당 로그 기록
+      try {
+        await logTaskAssigned(task.id, selectedBufferRobot.id, selectedBufferRobot.name, sourceBufferStation.name, bufferName);
+      } catch (error) {
+        console.error('[TASK_LOG] 버퍼간 호출 태스크 할당 로그 기록 오류:', error.message);
+      }
+      
+      return; // 다른 버퍼에서 로봇을 호출했으므로 여기서 처리 종료
+    } else {
+      // 충전 스테이션에 로봇이 있는 경우의 처리
+      // 새로운 호출 조건 적용
+      let selectedRobot = null;
+      
+      if (robotsAtChargeStations.length >= 2) {
+        // 2대 이상: 배터리가 가장 높은 로봇 선택
+        const bestRobot = robotsAtChargeStations.reduce((highest, current) => {
+          return current.batteryLevel > highest.batteryLevel ? current : highest;
+        });
+        selectedRobot = bestRobot.robot;
+        console.log(`[버퍼버튼] 충전소에 ${robotsAtChargeStations.length}대 있음: 배터리 최고인 ${bestRobot.robot.name} (${bestRobot.batteryLevel}%) 선택`);
+      } else if (robotsAtChargeStations.length === 1) {
+        // 1대: 배터리 70% 이상인 경우만 호출
+        const singleRobotInfo = robotsAtChargeStations[0];
+        if (singleRobotInfo.batteryLevel >= 70) {
+          selectedRobot = singleRobotInfo.robot;
+          console.log(`[버퍼버튼] 충전소에 1대 있음: ${singleRobotInfo.robot.name} (${singleRobotInfo.batteryLevel}%) - 70% 이상이므로 호출`);
+        } else {
+          console.log(`[버퍼버튼] 충전소에 1대 있지만 배터리가 ${singleRobotInfo.batteryLevel}%로 70% 미만입니다. 호출하지 않습니다.`);
+          return;
+        }
+      }
+      
+      if (!selectedRobot) {
+        console.log(`[버퍼버튼] 호출 조건을 만족하는 로봇이 없습니다.`);
+        return;
+      }
+      
+      const batteryLevel = selectedRobot.battery || 0;
+      console.log(`[버퍼버튼] 선택된 로봇: ${selectedRobot.name} (배터리: ${batteryLevel}%)`);
+      console.log(`[버퍼버튼] ${bufferName}로 로봇(${selectedRobot.name}, 배터리:${batteryLevel}%) 호출 시작`);
+      
+      // 기존 태스크 상태 확인
+      if (!(await checkRobotTaskStatus(selectedRobot))) {
+        console.log(`[버퍼버튼] 로봇 ${selectedRobot.name}에 이미 실행 중인 태스크가 있어 호출을 건너뜁니다.`);
+        return;
+      }
+      
+      // 목적지 중복 체크
+      if (!(await checkDestinationConflict(bufferSt.id, selectedRobot.id))) {
+        console.log(`[버퍼버튼] 목적지 ${bufferName}에 대한 중복 태스크가 있어 호출을 건너뜁니다.`);
+        return;
+      }
+      
+      // 버퍼 PRE 스테이션 찾기
+      const bufferPreSt = stations.find(s => s.name === `${bufferName}_PRE`);
+      
+      if (!bufferPreSt) {
+        console.error(`[버퍼버튼] ${bufferName}_PRE 스테이션을 찾을 수 없습니다.`);
+        return;
+      }
+      
+      // 태스크 생성 (충전소 → 버퍼_PRE → 버퍼)
+      const task = await Task.create(
+        {
+          robot_id: selectedRobot.id,
+          steps: [
+            {
+              seq: 0,
+              type: 'NAV',
+              payload: JSON.stringify({ dest: bufferPreSt.id }),
+              status: 'PENDING',
+            },
+            {
+              seq: 1,
+              type: 'NAV',
+              payload: JSON.stringify({ dest: bufferSt.id }),
+              status: 'PENDING',
+            }
+          ],
+        },
+        { include: [{ model: TaskStep, as: 'steps' }] },
+      );
+      
+      console.log(`[버퍼버튼] 충전소에서 로봇(${selectedRobot.name})을 ${bufferName}으로 호출하는 태스크 생성 완료 (태스크 ID: ${task.id})`);
+      await log('BUTTON_TASK', `충전소 호출: ${selectedRobot.name} → ${bufferName}`, { robot_name: selectedRobot.name });
+      
+      // 태스크 할당 로그 기록
+      try {
+        await logTaskAssigned(task.id, selectedRobot.id, selectedRobot.name, 'charge_1', bufferName);
+      } catch (error) {
+        console.error('[TASK_LOG] 충전소 호출 태스크 할당 로그 기록 오류:', error.message);
+      }
+      
+      return; // 충전소에서 로봇을 호출했으므로 여기서 처리 종료
+    }
   } catch (error) {
     console.error(`[버퍼버튼] 오류 발생:`, error);
     throw error;
@@ -1737,3 +2212,941 @@ async function callAmrToBuffer(region, bufferNum) {
 
 exports.sendGotoNav = sendGotoNav;
 exports.setRioRegister17 = setRioRegister17;
+exports.setRioRegister = setRioRegister;
+exports.setBufferButtonFeedback = setBufferButtonFeedback;
+exports.checkDestinationConflict = checkDestinationConflict;
+
+// 자동 충전 로직: B동 버퍼에 있는 배터리 30% 이하 AMR을 충전소로 이동
+async function checkAndSendLowBatteryRobotsToChargeStation(map, stations, robots) {
+  try {
+    if (!map || !stations || !robots) return;
+    
+    // B지역 버퍼 스테이션들 찾기
+    const bBufferStations = stations.filter(s => 
+      regionOf(s) === 'B' && 
+      hasClass(s, '버퍼') && 
+      s.name.match(/^B[1-3]$/) // B1, B2, B3 형태
+    );
+    
+    // A지역 버퍼 스테이션들 찾기
+    const aBufferStations = stations.filter(s => 
+      regionOf(s) === 'A' && 
+      hasClass(s, '버퍼') && 
+      s.name.match(/^A[1-3]$/) // A1, A2, A3 형태
+    );
+    
+    // B지역 충전 스테이션들 찾기
+    const bChargeStations = stations.filter(s => 
+      regionOf(s) === 'B' && 
+      hasClass(s, '충전')
+    );
+    
+    if (bChargeStations.length === 0) {
+      console.log('[AUTO_CHARGE] B지역 충전 스테이션을 찾을 수 없습니다.');
+      return;
+    }
+    
+    // A→B 이동에 필요한 스테이션들 찾기
+    const icA = stations.find(s => regionOf(s) === 'A' && hasClass(s, 'IC'));
+    const icB = stations.find(s => regionOf(s) === 'B' && hasClass(s, 'IC'));
+    const lm78 = stations.find(s => String(s.id) === '78' || s.name === 'LM78');
+    
+    // 저배터리 로봇들 수집
+    const lowBatteryRobots = [];
+    
+    // B지역 버퍼에 있는 로봇들 중 배터리 30% 이하인 로봇 찾기
+    for (const bufferStation of bBufferStations) {
+      const robotAtBuffer = robots.find(r => String(r.location) === String(bufferStation.id));
+      
+      if (robotAtBuffer) {
+        const batteryLevel = robotAtBuffer.battery || 0;
+        
+        if (batteryLevel <= 50) {
+          // 기존 태스크가 있는지 확인
+          const hasTask = await checkRobotTaskStatus(robotAtBuffer);
+          
+          if (hasTask) {
+            lowBatteryRobots.push({
+              robot: robotAtBuffer,
+              currentStation: bufferStation,
+              batteryLevel: batteryLevel,
+              region: 'B'
+            });
+            
+            console.log(`[AUTO_CHARGE] B지역 저배터리 로봇 발견: ${robotAtBuffer.name} (${batteryLevel}%) at ${bufferStation.name}`);
+          } else {
+            console.log(`[AUTO_CHARGE] B지역 저배터리 로봇 ${robotAtBuffer.name}에 이미 태스크가 있어 건너뜀`);
+          }
+        }
+      }
+    }
+    
+    // A지역 버퍼에 있는 로봇들 중 배터리 30% 이하인 로봇 찾기
+    if (aBufferStations.length > 0 && icA && icB && lm78) {
+      for (const bufferStation of aBufferStations) {
+        const robotAtBuffer = robots.find(r => String(r.location) === String(bufferStation.id));
+        
+        if (robotAtBuffer) {
+          const batteryLevel = robotAtBuffer.battery || 0;
+          
+          if (batteryLevel <= 50) {
+            // 기존 태스크가 있는지 확인
+            const hasTask = await checkRobotTaskStatus(robotAtBuffer);
+            
+            if (hasTask) {
+              lowBatteryRobots.push({
+                robot: robotAtBuffer,
+                currentStation: bufferStation,
+                batteryLevel: batteryLevel,
+                region: 'A'
+              });
+              
+              console.log(`[AUTO_CHARGE] A지역 저배터리 로봇 발견: ${robotAtBuffer.name} (${batteryLevel}%) at ${bufferStation.name}`);
+            } else {
+              console.log(`[AUTO_CHARGE] A지역 저배터리 로봇 ${robotAtBuffer.name}에 이미 태스크가 있어 건너뜀`);
+            }
+          }
+        }
+      }
+    } else if (aBufferStations.length > 0) {
+      console.log('[AUTO_CHARGE] A지역 버퍼가 있지만 A→B 이동에 필요한 스테이션을 찾을 수 없습니다. (IC-A, IC-B, LM78 필요)');
+    }
+    
+    if (lowBatteryRobots.length === 0) {
+      //console.log('[AUTO_CHARGE] 배터리 50% 이하의 태스크 없는 로봇이 없습니다.');
+      return;
+    }
+    
+    // 각 저배터리 로봇을 빈 충전소로 보내기
+    for (const { robot, currentStation, batteryLevel, region } of lowBatteryRobots) {
+      try {
+        // 빈 충전 스테이션 찾기
+        const emptyChargeStation = bChargeStations.find(cs => 
+          !robots.some(r => String(r.location) === String(cs.id))
+        );
+        
+        if (!emptyChargeStation) {
+          console.log(`[AUTO_CHARGE] ${robot.name}: 빈 충전 스테이션이 없어 대기`);
+          continue;
+        }
+        
+        // 충전 스테이션의 PRE 스테이션 찾기
+        const chargePreStation = stations.find(s => 
+          s.name === `${emptyChargeStation.name}_PRE`
+        );
+        
+        if (!chargePreStation) {
+          console.log(`[AUTO_CHARGE] ${robot.name}: ${emptyChargeStation.name}_PRE 스테이션을 찾을 수 없음`);
+          continue;
+        }
+        
+        // 목적지 중복 체크
+        if (!(await checkDestinationConflict(emptyChargeStation.id, robot.id))) {
+          console.log(`[AUTO_CHARGE] ${robot.name}: 충전소 ${emptyChargeStation.name}에 대한 중복 태스크가 있어 건너뜀`);
+          continue;
+        }
+        
+        let taskSteps = [];
+        
+        if (region === 'B') {
+          // B지역: 기존 로직 (JACK_DOWN → 충전소PRE → 충전소)
+          taskSteps = [
+            {
+              seq: 0,
+              type: 'JACK_DOWN',
+              payload: JSON.stringify({ height: 0.0 }),
+              status: 'PENDING',
+            },
+            {
+              seq: 1,
+              type: 'NAV',
+              payload: JSON.stringify({ dest: chargePreStation.id }),
+              status: 'PENDING',
+            },
+            {
+              seq: 2,
+              type: 'NAV',
+              payload: JSON.stringify({ dest: emptyChargeStation.id }),
+              status: 'PENDING',
+            }
+          ];
+        } else if (region === 'A') {
+          // A지역: JACK_DOWN → IC-A → WAIT_FREE_PATH → LM78 → IC-B → 동적으로 빈 충전소 찾기
+          taskSteps = [
+            {
+              seq: 0,
+              type: 'JACK_DOWN',
+              payload: JSON.stringify({ height: 0.0 }),
+              status: 'PENDING',
+            },
+            {
+              seq: 1,
+              type: 'NAV',
+              payload: JSON.stringify({ dest: icA.id }),
+              status: 'PENDING',
+            },
+            {
+              seq: 2,
+              type: 'WAIT_FREE_PATH',
+              payload: JSON.stringify({}),
+              status: 'PENDING',
+            },
+            {
+              seq: 3,
+              type: 'NAV',
+              payload: JSON.stringify({ dest: lm78.id }),
+              status: 'PENDING',
+            },
+            {
+              seq: 4,
+              type: 'NAV',
+              payload: JSON.stringify({ dest: icB.id }),
+              status: 'PENDING',
+            },
+            {
+              seq: 5,
+              type: 'FIND_EMPTY_B_CHARGE',
+              payload: JSON.stringify({}),
+              status: 'PENDING',
+            }
+          ];
+        }
+        
+        // 자동 충전 태스크 생성
+        const task = await Task.create(
+          {
+            robot_id: robot.id,
+            steps: taskSteps,
+          },
+          { include: [{ model: TaskStep, as: 'steps' }] },
+        );
+        
+        console.log(`[AUTO_CHARGE] ${region}지역 ${robot.name} (배터리:${batteryLevel}%) → ${emptyChargeStation.name} 자동 충전 태스크 생성 (태스크 ID: ${task.id})`);
+        await log('AUTO_CHARGE', `자동 충전: ${region}지역 ${robot.name} (${batteryLevel}%) → ${emptyChargeStation.name}`, { robot_name: robot.name });
+        
+        // 태스크 할당 로그 기록
+        try {
+          await logTaskAssigned(task.id, robot.id, robot.name, currentStation.name, emptyChargeStation.name);
+        } catch (error) {
+          console.error('[TASK_LOG] 자동 충전 태스크 할당 로그 기록 오류:', error.message);
+        }
+        
+      } catch (error) {
+        console.error(`[AUTO_CHARGE] ${robot.name} 자동 충전 태스크 생성 오류:`, error.message);
+      }
+    }
+    
+  } catch (error) {
+    console.error('[AUTO_CHARGE] 자동 충전 로직 오류:', error.message);
+  }
+}
+
+exports.sendGotoNav = sendGotoNav;
+
+// 새로운 우선순위 기반 AMR 호출 함수
+async function callAmrToBufferWithPriority(region, bufferNum, bufferName, targetSt, stations, robots) {
+  console.log(`[우선순위호출] ${bufferName} 버퍼 호출 시작`);
+  
+  // 필요한 스테이션들 미리 찾기
+  const targetBufferPreSt = stations.find(s => s.name === `${bufferName}_PRE`);
+  const icA = stations.find(s => regionOf(s) === 'A' && hasClass(s, 'IC'));
+  const icB = stations.find(s => regionOf(s) === 'B' && hasClass(s, 'IC'));
+  const lm73 = stations.find(s => String(s.id) === '73' || s.name === 'LM73');
+  
+  if (!targetBufferPreSt) {
+    console.error(`[우선순위호출] ${bufferName}_PRE 스테이션을 찾을 수 없습니다.`);
+    return null;
+  }
+  
+  // 우선순위 1: 같은 지역(A,B)의 버퍼(A1~3, B1~3)에 있는 다른 AMR
+  console.log(`[우선순위호출] 우선순위 1: ${region} 지역 다른 버퍼에서 AMR 찾기`);
+  
+  const sameRegionBuffers = stations.filter(s => 
+    regionOf(s) === region && 
+    hasClass(s, '버퍼') && 
+    s.name.match(/^[AB][1-3]$/) && 
+    s.name !== bufferName
+  );
+  
+  for (const bufferSt of sameRegionBuffers) {
+    const robotAtBuffer = robots.find(r => String(r.location) === String(bufferSt.id));
+    
+    if (robotAtBuffer) {
+      // 기존 태스크 상태 확인
+      const hasTask = await checkRobotTaskStatus(robotAtBuffer);
+      
+      if (hasTask) {
+        // 목적지 중복 체크
+        if (await checkDestinationConflict(targetSt.id, robotAtBuffer.id)) {
+          console.log(`[우선순위호출] 우선순위 1 성공: ${bufferSt.name}의 로봇 ${robotAtBuffer.name} 선택`);
+          
+          // 소스 버퍼의 PRE 스테이션 찾기
+          const sourceBufferPreSt = stations.find(s => s.name === `${bufferSt.name}_PRE`);
+          
+          if (!sourceBufferPreSt) {
+            console.error(`[우선순위호출] ${bufferSt.name}_PRE 스테이션을 찾을 수 없습니다.`);
+            continue;
+          }
+          
+          // 1번 시퀀스: JACK_DOWN → 소스버퍼_PRE → 타겟버퍼_PRE → 타겟버퍼 → JACK_UP
+          const task = await Task.create(
+            {
+              robot_id: robotAtBuffer.id,
+              steps: [
+                {
+                  seq: 0,
+                  type: 'JACK_DOWN',
+                  payload: JSON.stringify({ height: 0.0 }),
+                  status: 'PENDING',
+                },
+                {
+                  seq: 1,
+                  type: 'NAV',
+                  payload: JSON.stringify({ dest: sourceBufferPreSt.id }),
+                  status: 'PENDING',
+                },
+                {
+                  seq: 2,
+                  type: 'NAV',
+                  payload: JSON.stringify({ dest: targetBufferPreSt.id }),
+                  status: 'PENDING',
+                },
+                {
+                  seq: 3,
+                  type: 'NAV',
+                  payload: JSON.stringify({ dest: targetSt.id }),
+                  status: 'PENDING',
+                },
+                {
+                  seq: 4,
+                  type: 'JACK_UP',
+                  payload: JSON.stringify({ height: 0.03 }),
+                  status: 'PENDING',
+                }
+              ],
+            },
+            { include: [{ model: TaskStep, as: 'steps' }] },
+          );
+          
+          await log('PRIORITY_CALL', `우선순위1-버퍼간: ${robotAtBuffer.name} ${bufferSt.name} → ${bufferName}`, { robot_name: robotAtBuffer.name });
+          
+          try {
+            await logTaskAssigned(task.id, robotAtBuffer.id, robotAtBuffer.name, bufferSt.name, bufferName);
+          } catch (error) {
+            console.error('[TASK_LOG] 우선순위1 태스크 할당 로그 기록 오류:', error.message);
+          }
+          
+          return { robot: robotAtBuffer, source: bufferSt.name, task: task };
+        }
+      }
+    }
+  }
+  
+  //우선순위 2: 충전소에 있는 AMR 중 배터리가 가장 높고 30% 이상인 것
+
+  console.log(`[우선순위호출] 우선순위 2: 충전소에서 AMR 찾기`);
+  
+  const chargeStations = stations.filter(s => hasClass(s, '충전'));
+  const robotsAtChargeStations = [];
+  
+  for (const chargeSt of chargeStations) {
+    const robotAtCharge = robots.find(r => String(r.location) === String(chargeSt.id));
+    if (robotAtCharge) {
+      const batteryLevel = robotAtCharge.battery || 0;
+      if (batteryLevel >= 30) {
+        robotsAtChargeStations.push({ 
+          robot: robotAtCharge, 
+          batteryLevel, 
+          chargeStation: chargeSt 
+        });
+      }
+    }
+  }
+  
+  if (robotsAtChargeStations.length > 0) {
+    // 배터리가 가장 높은 로봇 선택
+    const bestChargeRobot = robotsAtChargeStations.reduce((highest, current) => {
+      return current.batteryLevel > highest.batteryLevel ? current : highest;
+    });
+    
+    const selectedRobot = bestChargeRobot.robot;
+    const chargeRegion = regionOf(bestChargeRobot.chargeStation);
+    
+    // 기존 태스크 상태 및 목적지 중복 체크
+    if ((await checkRobotTaskStatus(selectedRobot)) && 
+        (await checkDestinationConflict(targetSt.id, selectedRobot.id))) {
+      
+      console.log(`[우선순위호출] 우선순위 2 성공: 충전소의 로봇 ${selectedRobot.name} (배터리: ${bestChargeRobot.batteryLevel}%, 충전소 지역: ${chargeRegion}) 선택`);
+      
+      let taskSteps = [];
+      
+      if (region === 'B') {
+        // B동 버퍼: 호출한 버퍼의 PRE → 버퍼 → JACK_UP
+        taskSteps = [
+          {
+            seq: 0,
+            type: 'NAV',
+            payload: JSON.stringify({ dest: targetBufferPreSt.id }),
+            status: 'PENDING',
+          },
+          {
+            seq: 1,
+            type: 'NAV',
+            payload: JSON.stringify({ dest: targetSt.id }),
+            status: 'PENDING',
+          },
+          {
+            seq: 2,
+            type: 'JACK_UP',
+            payload: JSON.stringify({ height: 0.03 }),
+            status: 'PENDING',
+          }
+        ];
+      } else if (region === 'A' && chargeRegion === 'B') {
+        // A동에서 충전소(B동)에 있는 로봇을 호출: IC-B → WAIT_FREE_PATH → LM73 → WAIT_FREE_PATH → IC-A → WAIT_FREE_PATH → 호출한 버퍼의 PRE → 버퍼 → JACK_UP
+        if (!icB || !lm73 || !icA) {
+          console.error(`[우선순위호출] 필요한 스테이션을 찾을 수 없습니다: IC-B=${!!icB}, LM73=${!!lm73}, IC-A=${!!icA}`);
+          return null;
+        }
+        
+        taskSteps = [
+          {
+            seq: 0,
+            type: 'NAV',
+            payload: JSON.stringify({ dest: icB.id }),
+            status: 'PENDING',
+          },
+          {
+            seq: 1,
+            type: 'WAIT_FREE_PATH',
+            payload: JSON.stringify({}),
+            status: 'PENDING',
+          },
+          {
+            seq: 2,
+            type: 'NAV',
+            payload: JSON.stringify({ dest: lm73.id }),
+            status: 'PENDING',
+          },
+          {
+            seq: 3,
+            type: 'WAIT_FREE_PATH',
+            payload: JSON.stringify({}),
+            status: 'PENDING',
+          },
+          {
+            seq: 4,
+            type: 'NAV',
+            payload: JSON.stringify({ dest: icA.id }),
+            status: 'PENDING',
+          },
+          {
+            seq: 5,
+            type: 'WAIT_FREE_PATH',
+            payload: JSON.stringify({}),
+            status: 'PENDING',
+          },
+          {
+            seq: 6,
+            type: 'NAV',
+            payload: JSON.stringify({ dest: targetBufferPreSt.id }),
+            status: 'PENDING',
+          },
+          {
+            seq: 7,
+            type: 'NAV',
+            payload: JSON.stringify({ dest: targetSt.id }),
+            status: 'PENDING',
+          },
+          {
+            seq: 8,
+            type: 'JACK_UP',
+            payload: JSON.stringify({ height: 0.03 }),
+            status: 'PENDING',
+          }
+        ];
+      } else {
+        // A동에서 A동 충전소 또는 기타
+        taskSteps = [
+          {
+            seq: 0,
+            type: 'NAV',
+            payload: JSON.stringify({ dest: targetBufferPreSt.id }),
+            status: 'PENDING',
+          },
+          {
+            seq: 1,
+            type: 'NAV',
+            payload: JSON.stringify({ dest: targetSt.id }),
+            status: 'PENDING',
+          },
+          {
+            seq: 2,
+            type: 'JACK_UP',
+            payload: JSON.stringify({ height: 0.03 }),
+            status: 'PENDING',
+          }
+        ];
+      }
+      
+      const task = await Task.create(
+        {
+          robot_id: selectedRobot.id,
+          steps: taskSteps,
+        },
+        { include: [{ model: TaskStep, as: 'steps' }] },
+      );
+      
+      await log('PRIORITY_CALL', `우선순위2-충전소: ${selectedRobot.name} (${bestChargeRobot.batteryLevel}%) → ${bufferName}`, { robot_name: selectedRobot.name });
+      
+      try {
+        await logTaskAssigned(task.id, selectedRobot.id, selectedRobot.name, bestChargeRobot.chargeStation.name, bufferName);
+      } catch (error) {
+        console.error('[TASK_LOG] 우선순위2 태스크 할당 로그 기록 오류:', error.message);
+      }
+      
+      return { robot: selectedRobot, source: bestChargeRobot.chargeStation.name, task: task };
+    }
+  }
+  
+  // 우선순위 3: 다른 지역의 버퍼에 있는 AMR (A동 버퍼에서 B동 버퍼 호출만 처리)
+  console.log(`[우선순위호출] 우선순위 3 시작: 호출 지역=${region}`);
+  if (region === 'A') {
+    console.log(`[우선순위호출] 우선순위 3: B 지역 버퍼에서 AMR 찾기`);
+    
+    const otherRegionBuffers = stations.filter(s => 
+      regionOf(s) === 'B' && 
+      hasClass(s, '버퍼') && 
+      s.name.match(/^B[1-3]$/)
+    );
+    
+    for (const bufferSt of otherRegionBuffers) {
+      const robotAtBuffer = robots.find(r => String(r.location) === String(bufferSt.id));
+      
+      if (robotAtBuffer) {
+        // 기존 태스크 상태 확인
+        const hasTask = await checkRobotTaskStatus(robotAtBuffer);
+        
+        if (hasTask) {
+          // 목적지 중복 체크
+          if (await checkDestinationConflict(targetSt.id, robotAtBuffer.id)) {
+            console.log(`[우선순위호출] 우선순위 3 성공: A지역 ${bufferSt.name}의 로봇 ${robotAtBuffer.name} 선택`);
+            
+            // 소스 버퍼의 PRE 스테이션 찾기
+            const sourceBufferPreSt = stations.find(s => s.name === `${bufferSt.name}_PRE`);
+            
+            if (!sourceBufferPreSt) {
+              console.error(`[우선순위호출] ${bufferSt.name}_PRE 스테이션을 찾을 수 없습니다.`);
+              continue;
+            }
+            
+            // 1번 시퀀스: JACK_DOWN → 소스버퍼_PRE → 타겟버퍼_PRE → 타겟버퍼 → JACK_UP
+            const task = await Task.create(
+              {
+                robot_id: robotAtBuffer.id,
+                steps: [
+                  {
+                    seq: 0,
+                    type: 'JACK_DOWN',
+                    payload: JSON.stringify({ height: 0.0 }),
+                    status: 'PENDING',
+                  },
+                  {
+                    seq: 1,
+                    type: 'NAV',
+                    payload: JSON.stringify({ dest: sourceBufferPreSt.id }),
+                    status: 'PENDING',
+                  },
+                  {
+                    seq: 2,
+                    type: 'JACK_DOWN',
+                    payload: JSON.stringify({ height: 0.0 }),
+                    status: 'PENDING',
+                  },
+                  {
+                    seq: 3,
+                    type: 'NAV',
+                    payload: JSON.stringify({ dest: icB.id }),
+                    status: 'PENDING',
+                  },
+                  {
+                    seq: 4,
+                    type: 'WAIT_FREE_PATH',
+                    payload: JSON.stringify({}),
+                    status: 'PENDING',
+                  },
+                  {
+                    seq: 5,
+                    type: 'NAV',
+                    payload: JSON.stringify({ dest: lm73.id }),
+                    status: 'PENDING',
+                  },
+                  {
+                    seq: 6,
+                    type: 'WAIT_FREE_PATH',
+                    payload: JSON.stringify({}),
+                    status: 'PENDING',
+                  },
+                  {
+                    seq: 7,
+                    type: 'NAV',
+                    payload: JSON.stringify({ dest: icA.id }),
+                    status: 'PENDING',
+                  },
+                  {
+                    seq: 8,
+                    type: 'WAIT_FREE_PATH',
+                    payload: JSON.stringify({}),
+                    status: 'PENDING',
+                  },
+                  {
+                    seq: 9,
+                    type: 'NAV',
+                    payload: JSON.stringify({ dest: targetBufferPreSt.id }),
+                    status: 'PENDING',
+                  },
+                  {
+                    seq: 10,
+                    type: 'NAV',
+                    payload: JSON.stringify({ dest: targetSt.id }),
+                    status: 'PENDING',
+                  },
+                  {
+                    seq: 11,
+                    type: 'JACK_UP',
+                    payload: JSON.stringify({ height: 0.03 }),
+                    status: 'PENDING',
+                  }
+                ],
+              },
+              { include: [{ model: TaskStep, as: 'steps' }] },
+            );
+            
+            await log('PRIORITY_CALL', `우선순위3-지역간: ${robotAtBuffer.name} A지역 ${bufferSt.name} → B지역 ${bufferName}`, { robot_name: robotAtBuffer.name });
+            
+            try {
+              await logTaskAssigned(task.id, robotAtBuffer.id, robotAtBuffer.name, bufferSt.name, bufferName);
+            } catch (error) {
+              console.error('[TASK_LOG] 우선순위3 태스크 할당 로그 기록 오류:', error.message);
+            }
+            return { robot: robotAtBuffer, source: bufferSt.name, task: task };
+          }
+        }
+      }
+    }
+  }
+  
+  console.log(`[우선순위호출] 모든 우선순위에서 호출 가능한 AMR을 찾지 못했습니다.`);
+  return null;
+}
+
+/* ─────────────── 정시 충전 스케줄러 ─────────────────────────── */
+
+// 정시 충전 스케줄러 초기화
+function initScheduledCharging() {
+  console.log('[정시충전] 스케줄러 시작: 11:40, 16:50');
+  
+  // 매일 11:40에 실행
+  cron.schedule('0 40 11 * * *', async () => {
+    console.log('\n=== 11:40 정시 충전 시작 ===');
+    await executeScheduledCharging('morning');
+  });
+
+  // 매일 16:50에 실행  
+  cron.schedule('0 50 16 * * *', async () => {
+    console.log('\n=== 16:50 정시 충전 시작 ===');
+    await executeScheduledCharging('afternoon');
+  });
+}
+
+// 정시 충전 실행 함수
+async function executeScheduledCharging(timeSlot) {
+  try {
+    console.log(`[정시충전] ${timeSlot} 시간대 충전 작업 시작`);
+    
+    // 1. 현재 맵과 스테이션 정보 로드
+    const map = await MapDB.findOne({ where: { is_current: true } });
+    if (!map) {
+      console.error('[정시충전] 맵 정보를 찾을 수 없습니다.');
+      return;
+    }
+    
+    const stations = (JSON.parse(map.stations || '{}').stations) || [];
+    const robots = await Robot.findAll();
+    
+    // 2. 버퍼에 있는 AMR들 찾기
+    const bufferAmrs = await findAmrsInBuffers(stations, robots);
+    
+    if (bufferAmrs.length === 0) {
+      console.log(`[정시충전] 버퍼에 태스크 없는 AMR이 없습니다.`);
+      return;
+    }
+    
+    console.log(`[정시충전] 버퍼 AMR 발견: ${bufferAmrs.map(a => `${a.robot.name}(${a.location})`).join(', ')}`);
+    
+    // 3. 빈 충전소 확인
+    const availableChargeStations = findAvailableChargeStations(stations, robots);
+    
+    if (availableChargeStations.length === 0) {
+      console.log(`[정시충전] 사용 가능한 충전소가 없습니다.`);
+      return;
+    }
+    
+    console.log(`[정시충전] 사용 가능한 충전소: ${availableChargeStations.map(cs => cs.name).join(', ')}`);
+    
+    // 4. 충전 태스크 생성
+    await createScheduledChargingTasks(bufferAmrs, availableChargeStations, stations, timeSlot);
+    
+    console.log(`[정시충전] ${timeSlot} 시간대 충전 작업 완료\n`);
+    
+  } catch (error) {
+    console.error(`[정시충전] ${timeSlot} 시간대 오류:`, error.message);
+  }
+}
+
+// 버퍼에 있는 태스크 없는 AMR들 찾기
+async function findAmrsInBuffers(stations, robots) {
+  const bufferAmrs = [];
+  
+  // A동, B동 버퍼 스테이션들 찾기
+  const bufferStations = stations.filter(s => 
+    (regionOf(s) === 'A' || regionOf(s) === 'B') && 
+    hasClass(s, '버퍼') && 
+    s.name.match(/^[AB][1-3]$/) // A1-A3, B1-B3 형태
+  );
+  
+  for (const bufferStation of bufferStations) {
+    const robotAtBuffer = robots.find(r => String(r.location) === String(bufferStation.id));
+    
+    if (robotAtBuffer) {
+      // 현재 실행 중인 태스크가 있는지 확인
+      const hasTask = await checkRobotTaskStatus(robotAtBuffer);
+      
+      if (hasTask) {
+        bufferAmrs.push({
+          robot: robotAtBuffer,
+          location: bufferStation.name,
+          region: regionOf(bufferStation)
+        });
+        console.log(`[정시충전] 대상 AMR: ${robotAtBuffer.name} at ${bufferStation.name} (태스크 없음)`);
+      } else {
+        console.log(`[정시충전] 제외 AMR: ${robotAtBuffer.name} at ${bufferStation.name} (태스크 실행 중)`);
+      }
+    }
+  }
+  
+  return bufferAmrs;
+}
+
+// 사용 가능한 충전소들 찾기
+function findAvailableChargeStations(stations, robots) {
+  const chargeStations = stations.filter(s => hasClass(s, '충전'));
+  
+  return chargeStations.filter(cs => {
+    // 충전소에 로봇이 없는지 확인
+    const robotAtCharge = robots.find(r => String(r.location) === String(cs.id));
+    return !robotAtCharge;
+  });
+}
+
+// 정시 충전 태스크들 생성 (순차 실행으로 수정)
+async function createScheduledChargingTasks(bufferAmrs, availableChargeStations, stations, timeSlot) {
+  const icA = stations.find(s => regionOf(s) === 'A' && hasClass(s, 'IC'));
+  const icB = stations.find(s => regionOf(s) === 'B' && hasClass(s, 'IC'));
+  const lm78 = stations.find(s => String(s.id) === '78' || s.name === 'LM78');
+  
+  if (bufferAmrs.length === 0) {
+    console.log(`[정시충전] 충전할 AMR이 없습니다.`);
+    return;
+  }
+
+  console.log(`[정시충전] 총 ${bufferAmrs.length}대의 AMR을 순차적으로 충전소로 보냅니다 (1분 간격)`);
+  
+  // 첫 번째 AMR은 즉시 실행
+  await createSingleChargingTask(bufferAmrs[0], availableChargeStations[0], stations, timeSlot, icA, icB, lm78, 0);
+
+  // 나머지 AMR들은 1분 간격으로 순차 실행
+  for (let i = 1; i < bufferAmrs.length && i < availableChargeStations.length; i++) {
+    const delayMinutes = i * 1; // 1분씩 간격
+    const delayMs = delayMinutes * 60 * 1000;
+    
+    console.log(`[정시충전] ${bufferAmrs[i].robot.name}: ${delayMinutes}분 후 충전 태스크 예약됨`);
+    
+    setTimeout(async () => {
+      try {
+        // 태스크 생성 시점에 로봇 상태를 다시 확인
+        const robot = await Robot.findByPk(bufferAmrs[i].robot.id);
+        if (!robot) {
+          console.log(`[정시충전-지연] ${bufferAmrs[i].robot.name}: 로봇을 찾을 수 없음`);
+          return;
+        }
+
+        // 현재도 태스크가 없는지 다시 확인
+        const hasTask = await checkRobotTaskStatus(robot);
+        if (!hasTask) {
+          console.log(`[정시충전-지연] ${robot.name}: 태스크가 생성되어 충전 건너뜀`);
+          return;
+        }
+
+        // 충전소가 여전히 비어있는지 확인
+        const targetChargeStation = availableChargeStations[i];
+        const currentRobots = await Robot.findAll();
+        const robotAtCharge = currentRobots.find(r => String(r.location) === String(targetChargeStation.id));
+        
+        if (robotAtCharge) {
+          console.log(`[정시충전-지연] ${robot.name}: 충전소 ${targetChargeStation.name}이 이미 사용 중`);
+          // 다른 빈 충전소 찾기
+          const allChargeStations = stations.filter(s => hasClass(s, '충전'));
+          const emptyChargeStation = allChargeStations.find(cs => 
+            !currentRobots.some(r => String(r.location) === String(cs.id))
+          );
+          
+          if (!emptyChargeStation) {
+            console.log(`[정시충전-지연] ${robot.name}: 사용 가능한 충전소가 없어 건너뜀`);
+            return;
+          }
+          
+          console.log(`[정시충전-지연] ${robot.name}: 대체 충전소 ${emptyChargeStation.name} 사용`);
+          await createSingleChargingTask(
+            { robot, location: bufferAmrs[i].location, region: bufferAmrs[i].region }, 
+            emptyChargeStation, 
+            stations, 
+            timeSlot, 
+            icA, 
+            icB, 
+            lm78, 
+            i
+          );
+        } else {
+          await createSingleChargingTask(bufferAmrs[i], targetChargeStation, stations, timeSlot, icA, icB, lm78, i);
+        }
+        
+      } catch (error) {
+        console.error(`[정시충전-지연] ${bufferAmrs[i].robot.name} 오류:`, error.message);
+      }
+    }, delayMs);
+  }
+  
+  // 사용 가능한 충전소보다 AMR이 많은 경우 경고
+  if (bufferAmrs.length > availableChargeStations.length) {
+    console.log(`[정시충전] 경고: AMR ${bufferAmrs.length}대 > 충전소 ${availableChargeStations.length}개, 일부 AMR은 충전소 대기`);
+  }
+}
+
+// 단일 AMR 충전 태스크 생성 함수
+async function createSingleChargingTask(amrInfo, targetChargeStation, stations, timeSlot, icA, icB, lm78, index) {
+  const { robot, location, region } = amrInfo;
+  
+  // 충전소 PRE 스테이션 찾기
+  const chargePreStation = stations.find(s => s.name === `${targetChargeStation.name}_PRE`);
+  
+  if (!chargePreStation) {
+    console.log(`[정시충전] ${robot.name}: ${targetChargeStation.name}_PRE 스테이션을 찾을 수 없음`);
+    return;
+  }
+  
+  try {
+    let taskSteps = [];
+    
+    if (region === 'A') {
+      // A동 버퍼 AMR: JACK_DOWN → IC-A → WAIT_FREE_PATH → LM78 → IC-B → 충전소PRE → 충전소
+      if (!icA || !icB || !lm78) {
+        console.error(`[정시충전] ${robot.name}: A→B 이동에 필요한 스테이션 부족 (IC-A=${!!icA}, IC-B=${!!icB}, LM78=${!!lm78})`);
+        return;
+      }
+      
+      taskSteps = [
+        {
+          seq: 0,
+          type: 'JACK_DOWN',
+          payload: JSON.stringify({ height: 0.0 }),
+          status: 'PENDING',
+        },
+        {
+          seq: 1,
+          type: 'NAV',
+          payload: JSON.stringify({ dest: icA.id }),
+          status: 'PENDING',
+        },
+        {
+          seq: 2,
+          type: 'WAIT_FREE_PATH',
+          payload: JSON.stringify({}),
+          status: 'PENDING',
+        },
+        {
+          seq: 3,
+          type: 'NAV',
+          payload: JSON.stringify({ dest: lm78.id }),
+          status: 'PENDING',
+        },
+        {
+          seq: 4,
+          type: 'NAV',
+          payload: JSON.stringify({ dest: icB.id }),
+          status: 'PENDING',
+        },
+        {
+          seq: 5,
+          type: 'NAV',
+          payload: JSON.stringify({ dest: chargePreStation.id }),
+          status: 'PENDING',
+        },
+        {
+          seq: 6,
+          type: 'NAV',
+          payload: JSON.stringify({ dest: targetChargeStation.id }),
+          status: 'PENDING',
+        }
+      ];
+    } else if (region === 'B') {
+      // B동 버퍼 AMR: JACK_DOWN → 충전소PRE → 충전소
+      taskSteps = [
+        {
+          seq: 0,
+          type: 'JACK_DOWN',
+          payload: JSON.stringify({ height: 0.0 }),
+          status: 'PENDING',
+        },
+        {
+          seq: 1,
+          type: 'NAV',
+          payload: JSON.stringify({ dest: chargePreStation.id }),
+          status: 'PENDING',
+        },
+        {
+          seq: 2,
+          type: 'NAV',
+          payload: JSON.stringify({ dest: targetChargeStation.id }),
+          status: 'PENDING',
+        }
+      ];
+    }
+    
+    // 태스크 생성
+    const task = await Task.create(
+      {
+        robot_id: robot.id,
+        steps: taskSteps,
+      },
+      { include: [{ model: TaskStep, as: 'steps' }] },
+    );
+    
+    const executionTime = index === 0 ? '즉시' : `${index * 1}분 후`;
+    console.log(`[정시충전] ${robot.name} (${location}) → ${targetChargeStation.name} 태스크 생성 완료 (${executionTime}, 태스크 ID: ${task.id})`);
+    await log('SCHEDULED_CHARGE', `정시 충전 ${timeSlot} (${executionTime}): ${robot.name} (${location}) → ${targetChargeStation.name}`, { robot_name: robot.name });
+    
+    // 태스크 할당 로그 기록
+    try {
+      await logTaskAssigned(task.id, robot.id, robot.name, location, targetChargeStation.name);
+    } catch (error) {
+      console.error('[TASK_LOG] 정시 충전 태스크 할당 로그 기록 오류:', error.message);
+    }
+    
+  } catch (error) {
+    console.error(`[정시충전] ${robot.name} 태스크 생성 오류:`, error.message);
+  }
+}
+
+// 정시 충전 스케줄러 시작 (서버 부트 시 호출)
+initScheduledCharging();

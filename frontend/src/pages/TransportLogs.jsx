@@ -13,7 +13,7 @@ import { DownloadOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { useAtomValue } from "jotai";
 import { robotsQueryAtom } from "@/state/atoms";
-import { useLogs } from "@/hooks/useApiClient";
+import { useLogs, useTaskExecutionLogs } from "@/hooks/useApiClient";
 import { Resizable } from "react-resizable";
 import "react-resizable/css/styles.css";
 
@@ -82,6 +82,9 @@ export default function LogDashboard() {
 
   const { data: raw = [], isLoading } = useLogs();
 
+  /* --- 태스크 실행 로그 데이터 --- */
+  const { data: taskExecutionRaw = [], isLoading: isTaskExecutionLoading } = useTaskExecutionLogs();
+
   /* --- 타입별 분리 --- */
   const transportRows = useMemo(
     () => raw.filter((r) => r.type !== "CONN"),
@@ -112,6 +115,22 @@ export default function LogDashboard() {
     () => applyFilters(connRows),
     [connRows, range, amrName]
   );
+
+  /* --- 태스크 실행 로그 필터링 --- */
+  const displayTaskExecution = useMemo(() => {
+    return taskExecutionRaw.filter((row) => {
+      if (range[0] && range[1]) {
+        const t = dayjs(row.timestamp);
+        if (
+          t.isBefore(dayjs(range[0]).startOf("day")) ||
+          t.isAfter(dayjs(range[1]).endOf("day"))
+        )
+          return false;
+      }
+      if (amrName && row.robot_name !== amrName) return false;
+      return true;
+    });
+  }, [taskExecutionRaw, range, amrName]);
 
   /* --- 열 정의 --- */
   const baseCols = [
@@ -158,10 +177,104 @@ export default function LogDashboard() {
     { title: "메시지", dataIndex: "message", width: 200, ellipsis: true },
   ];
 
+  /* --- 태스크 실행 로그 컬럼 --- */
+  const taskExecutionColsInit = [
+    { title: "ID", dataIndex: "id", width: 80, sorter: (a, b) => a.id - b.id },
+    {
+      title: "시간",
+      dataIndex: "timestamp",
+      width: 160,
+      render: (v) => dayjs(v).format("YYYY-MM-DD HH:mm:ss"),
+      sorter: (a, b) =>
+        dayjs(a.timestamp).valueOf() - dayjs(b.timestamp).valueOf(),
+    },
+    {
+      title: "AMR",
+      dataIndex: "robot_name",
+      width: 120,
+      filters: robots.map((r) => ({ text: r.name, value: r.name })),
+      onFilter: (v, r) => r.robot_name === v,
+    },
+    {
+      title: "이벤트",
+      dataIndex: "event_type",
+      width: 140,
+      filters: [
+        { text: "버튼 눌림", value: "BUTTON_PRESSED" },
+        { text: "태스크 할당", value: "TASK_ASSIGNED" },
+        { text: "태스크 시작", value: "TASK_STARTED" },
+        { text: "스텝 시작", value: "STEP_STARTED" },
+        { text: "스텝 완료", value: "STEP_COMPLETED" },
+        { text: "스텝 실패", value: "STEP_FAILED" },
+        { text: "태스크 일시정지", value: "TASK_PAUSED" },
+        { text: "태스크 재개", value: "TASK_RESUMED" },
+        { text: "태스크 취소", value: "TASK_CANCELED" },
+        { text: "태스크 완료", value: "TASK_COMPLETED" },
+        { text: "태스크 실패", value: "TASK_FAILED" },
+      ],
+      onFilter: (v, r) => r.event_type === v,
+      render: (value) => {
+        const eventMap = {
+          BUTTON_PRESSED: "버튼 눌림",
+          TASK_ASSIGNED: "태스크 할당",
+          TASK_STARTED: "태스크 시작",
+          STEP_STARTED: "스텝 시작",
+          STEP_COMPLETED: "스텝 완료",
+          STEP_FAILED: "스텝 실패",
+          TASK_PAUSED: "태스크 일시정지",
+          TASK_RESUMED: "태스크 재개",
+          TASK_CANCELED: "태스크 취소",
+          TASK_COMPLETED: "태스크 완료",
+          TASK_FAILED: "태스크 실패",
+        };
+        return eventMap[value] || value;
+      },
+    },
+    { title: "태스크 ID", dataIndex: "task_id", width: 100 },
+    { title: "스텝 순서", dataIndex: "step_seq", width: 100 },
+    { title: "스텝 타입", dataIndex: "step_type", width: 120 },
+    {
+      title: "소요 시간",
+      dataIndex: "duration_ms",
+      width: 120,
+      render: (value) => {
+        if (!value) return "-";
+        if (value < 1000) return `${value}ms`;
+        return `${(value / 1000).toFixed(1)}s`;
+      },
+    },
+    { title: "출발지", dataIndex: "from_location", width: 120 },
+    { title: "목적지", dataIndex: "to_location", width: 120 },
+    {
+      title: "상세 정보",
+      dataIndex: "details",
+      width: 200,
+      ellipsis: true,
+      render: (value, record) => {
+        if (!value) return "-";
+        try {
+          const parsed = JSON.parse(value);
+          
+          // NAV/NAV_PRE 스텝인 경우 출발지와 목적지 정보 포함
+          if ((record.step_type === 'NAV' || record.step_type === 'NAV_PRE') && 
+              record.from_location && record.to_location) {
+            return `${parsed.description} (${record.from_location} → ${record.to_location})`;
+          }
+          
+          return parsed.description || value;
+        } catch {
+          return value;
+        }
+      },
+    },
+    { title: "오류 메시지", dataIndex: "error_message", width: 200, ellipsis: true },
+  ];
+
   const [transCols, setTransCols] = useState(transportColsInit);
   const [connCols, setConnCols] = useState(connColsInit);
+  const [taskExecutionCols, setTaskExecutionCols] = useState(taskExecutionColsInit);
 
-  /* ── Resizable 래퍼: onHeaderCell 은 ‘함수’ 여야 함 ── */
+  /* ── Resizable 래퍼: onHeaderCell 은 '함수' 여야 함 ── */
   const wrapResizable = (cols, setCols) =>
     cols.map((col, idx) =>
       col.width
@@ -227,7 +340,7 @@ export default function LogDashboard() {
         bodyStyle={{ padding: 16, display: "flex", flexDirection: "column" }}
       >
         {filters}
-        {isLoading ? (
+        {isLoading || isTaskExecutionLoading ? (
           <Spin style={{ marginTop: 32 }} />
         ) : (
           <Tabs defaultActiveKey="transport" style={{ flex: 1, minHeight: 0 }}>
@@ -251,6 +364,37 @@ export default function LogDashboard() {
                 components={components}
                 columns={wrapResizable(transCols, setTransCols)}
                 dataSource={displayTransport}
+                rowKey="id"
+                size="small"
+                pagination={{ pageSize: 20, showSizeChanger: false }}
+                scroll={{ y: 480 }}
+                style={{ marginTop: 12 }}
+              />
+            </Tabs.TabPane>
+
+            <Tabs.TabPane tab="태스크 실행 로그" key="taskExecution">
+              {csvBtn(
+                displayTaskExecution,
+                {
+                  id: "ID",
+                  timestamp: "Timestamp",
+                  robot_name: "AMR",
+                  event_type: "Event Type",
+                  task_id: "Task ID",
+                  step_seq: "Step Seq",
+                  step_type: "Step Type",
+                  duration_ms: "Duration (ms)",
+                  from_location: "From",
+                  to_location: "To",
+                  details: "Details",
+                  error_message: "Error",
+                },
+                "task_execution_logs.csv"
+              )}
+              <Table
+                components={components}
+                columns={wrapResizable(taskExecutionCols, setTaskExecutionCols)}
+                dataSource={displayTaskExecution}
                 rowKey="id"
                 size="small"
                 pagination={{ pageSize: 20, showSizeChanger: false }}

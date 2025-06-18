@@ -1,18 +1,22 @@
 // src/App.jsx
 import React, { useState, useEffect } from "react";
 import { Layout } from "antd";
-import { Routes, Route, Navigate } from "react-router-dom";
+import { Routes, Route, Navigate, useLocation } from "react-router-dom";
 import SideNav from "@/components/SideNav";
 // ─── Home.jsx 파일이 src/pages/Home 폴더 안에 있다면 이렇게 import ───
 import Home from "@/pages/Home";
 import MapSettings from "@/pages/MapSettings";
 import TransportLogs from "@/pages/TransportLogs";
 import MiscSettings from "@/pages/MiscSettings";
+import MobileStatus from "@/pages/Mobile/MobileStatus";
 import logo from "@/assets/logo.png";
 
 const { Sider, Content } = Layout;
 
 export default function App() {
+  const location = useLocation();
+  const isMobile = location.pathname.startsWith('/mobile');
+
   // ① localStorage 에서 불러오기, 기본값 false
   const [collapsed, setCollapsed] = useState(() => {
     try {
@@ -34,6 +38,20 @@ export default function App() {
     }
   };
 
+  // 모바일 전용 레이아웃
+  if (isMobile) {
+    return (
+      <Layout style={{ minHeight: "100vh" }}>
+        <Content style={{ padding: 0 }}>
+          <Routes>
+            <Route path="/mobile" element={<MobileStatus />} />
+          </Routes>
+        </Content>
+      </Layout>
+    );
+  }
+
+  // 데스크톱 레이아웃
   return (
     <Layout style={{ minHeight: "100vh" }}>
       <Sider
@@ -62,7 +80,7 @@ export default function App() {
       <Layout>
         <Content style={{ padding: 0 }}>
           <Routes>
-          <Route path="/" element={<Home />}  />
+            <Route path="/" element={<Home />}  />
             {/* <Route path="/" element={<Navigate to="/home" replace />} /> */}
             {/* <Route path="/home" element={<Home />} /> */}
             <Route path="/map" element={<MapSettings />} />

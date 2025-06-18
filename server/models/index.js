@@ -3,6 +3,8 @@ const sequelize = require('../config/db');
 
 const Task     = require('./Task');
 const TaskStep = require('./TaskStep');
+const TaskExecutionLog = require('./TaskExecutionLog');
+const Config = require('./Config');
 
 
 Task.hasMany(TaskStep, {
@@ -21,5 +23,7 @@ module.exports = {
   sequelize,
   Task,
   TaskStep,
+  TaskExecutionLog,
+  Config,
   // Robot, Map, …
 };

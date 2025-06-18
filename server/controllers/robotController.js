@@ -1,7 +1,8 @@
 // server/controllers/robotController.js
 const Robot = require('../models/Robot');
 const Map = require('../models/Map');
-const { sendGotoNav } = require('../services/dispatcherService')
+const { sendGotoNav } = require('../services/dispatcherService');
+const { logButtonPressed } = require('../services/taskExecutionLogger');
 
 
 
@@ -116,6 +117,13 @@ exports.moveToStation = async (req, res) => {
             { destination: st.name, status: '이동', timestamp: new Date() },
             { where: { id: robot.id } }
         );
+
+        // 6) TaskExecutionLog에 직접 네비게이션 명령 기록
+        try {
+            await logButtonPressed(robot.name, `직접 네비게이션 명령`, robot.location || '현재위치', st.name);
+        } catch (error) {
+            console.error('[TASK_LOG] 직접 네비게이션 로그 기록 오류:', error.message);
+        }
 
         return res.json({
             success: true,
