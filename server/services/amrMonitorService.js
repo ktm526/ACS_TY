@@ -77,6 +77,7 @@ function handlePush(sock, ip) {
             let json;
             try {
                 json = JSON.parse(payload);
+                //console.log(json)
                 //console.log(ip, json.vehicle_id)
             }
             catch (err) { continue;}//console.log('failed to json', ip, err, payload); continue; }

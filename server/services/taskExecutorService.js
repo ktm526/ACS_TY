@@ -634,102 +634,55 @@ if (step.type === 'WAIT_FREE_PATH') {
     // 대기 스테이션에 있는지 확인
     const isAtWaitingStation = currentSt && hasClass(currentSt, '대기');
     
-    // 클래스 기반 차단 체크 (대기 스테이션에 있든 없든 동일한 로직 적용)
+    // 경로 점유 기반 차단 체크 - 경로에 다른 로봇이 있으면 차단
     let blocked = false;
     const blockingRobots = [];
-    const myClasses = currentSt ? getCls(currentSt) : [];
     
     if (isFirstRun) {
-      console.log(`    ▶ [DEBUG] 현재 위치: ${currentSt ? currentSt.name : 'Unknown'}, 클래스=[${myClasses.join(', ')}], 대기스테이션=${isAtWaitingStation}`);
+      console.log(`    ▶ [DEBUG] 현재 위치: ${currentSt ? currentSt.name : 'Unknown'}, 대기스테이션=${isAtWaitingStation}`);
+      console.log(`    ▶ [DEBUG] 경로 스테이션 체크 시작: 경로에 다른 로봇이 있으면 차단`);
     }
     
     for (const ps of pathSts) {
       const robotOnPath = otherRobots.find(r => String(r.location) === String(ps.id));
       if (robotOnPath) {
-        // 해당 로봇의 목적지 확인
-        const robotDestination = robotOnPath.destination;
+        // 경로에 다른 로봇이 있으면 무조건 차단
+        blocked = true;
+        blockingRobots.push({
+          robot: robotOnPath.name,
+          location: ps.name,
+          reason: '경로 점유'
+        });
         
         if (isFirstRun) {
-          console.log(`    ▶ [DEBUG] 경로 위 로봇 ${robotOnPath.name}: destination="${robotDestination}"`);
-        }
-        
-        if (robotDestination) {
-          // 목적지 스테이션 찾기 (이름으로 먼저 시도, 실패하면 ID로 시도)
-          let destStation = stations.find(s => s.name === robotDestination);
-          if (!destStation) {
-            destStation = stations.find(s => String(s.id) === String(robotDestination));
-            if (isFirstRun) {
-              console.log(`    ▶ [DEBUG] 이름으로 찾기 실패, ID로 찾기 시도: ${destStation ? '성공' : '실패'}`);
-            }
-          }
-          
-          if (destStation) {
-            const destClasses = getCls(destStation);
-            
-            if (isFirstRun) {
-              console.log(`    ▶ [DEBUG] 목적지 스테이션 ${destStation.name}: 클래스=[${destClasses.join(', ')}]`);
-              console.log(`    ▶ [DEBUG] 현재 로봇 클래스=[${myClasses.join(', ')}]`);
-            }
-            
-            // 목적지 클래스가 현재 로봇의 클래스와 겹치는지 확인
-            const hasCommonClass = myClasses.some(myClass => destClasses.includes(myClass));
-            
-            if (isFirstRun) {
-              console.log(`    ▶ [DEBUG] 공통 클래스 있음: ${hasCommonClass}`);
-            }
-            
-            if (hasCommonClass) {
-              blocked = true;
-              blockingRobots.push({
-                robot: robotOnPath.name,
-                location: ps.name,
-                destination: destStation.name,
-                commonClasses: myClasses.filter(c => destClasses.includes(c))
-              });
-              
-              if (isFirstRun) {
-                console.log(`    ▶ [DEBUG] 로봇 ${robotOnPath.name}으로 인해 차단됨`);
-              }
-            } else {
-              if (isFirstRun) {
-                console.log(`    ▶ 경로 위 로봇 ${robotOnPath.name} (${ps.name}): 목적지 ${destStation.name} 클래스가 다르므로 무시`);
-              }
-            }
-          } else {
-            if (isFirstRun) {
-              console.log(`    ▶ 경로 위 로봇 ${robotOnPath.name}: 목적지 스테이션을 찾을 수 없음 (${robotDestination})`);
-            }
-          }
+          console.log(`    ▶ [DEBUG] 경로 ${ps.name}에 로봇 ${robotOnPath.name}이 있어 차단됨`);
         } else {
-          // 목적지가 없는 로봇은 기존처럼 차단으로 간주
-          blocked = true;
-          blockingRobots.push({
-            robot: robotOnPath.name,
-            location: ps.name,
-            destination: '목적지 없음',
-            commonClasses: ['목적지 미설정']
-          });
-          
-          if (isFirstRun) {
-            console.log(`    ▶ [DEBUG] 로봇 ${robotOnPath.name}: 목적지가 없어 차단됨`);
-          }
+          console.log(`    ▶ [WAIT_DEBUG] 경로 ${ps.name}에 로봇 ${robotOnPath.name}이 있어 차단 중`);
         }
       }
     }
     
     // 처음 실행될 때만 상세 로그 출력
     if (isFirstRun) {
-      console.log(`    ▶ WAIT_FREE_PATH 시작: 현재 로봇 클래스=[${myClasses.join(', ')}], 차단 상태=${blocked}${isAtWaitingStation ? ' (대기스테이션)' : ''}`);
+      console.log(`    ▶ WAIT_FREE_PATH 시작: 차단 상태=${blocked}${isAtWaitingStation ? ' (대기스테이션)' : ''}`);
       
       if (blocked && blockingRobots.length > 0) {
         console.log(`    ▶ 차단하는 로봇들:`);
         blockingRobots.forEach(info => {
-          console.log(`      - ${info.robot} (${info.location}): 목적지 ${info.destination}, 공통 클래스=[${info.commonClasses.join(', ')}]`);
+          console.log(`      - ${info.robot} (${info.location}): ${info.reason}`);
         });
       }
     } else {
-      // 대기 중일 때는 간단한 로그만 출력
+      // 대기 중일 때는 간단한 로그만 출력)
       console.log(`    ▶ WAIT_FREE_PATH 대기 중... blocked=${blocked} (차단 로봇: ${blockingRobots.length}개)${isAtWaitingStation ? ' (대기스테이션)' : ''}`);
+      
+      // 대기 중일 때도 차단 로봇 정보 출력 (디버깅용)
+      if (blocked && blockingRobots.length > 0) {
+        console.log(`    ▶ 차단 중인 로봇들:`);
+        blockingRobots.forEach(info => {
+          console.log(`      - ${info.robot} (${info.location}): ${info.reason}`);
+        });
+      }
     }
   
     if (blocked) {
